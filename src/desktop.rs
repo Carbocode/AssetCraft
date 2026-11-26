@@ -689,6 +689,7 @@ struct Desktop {
     notes_draft: Option<(Uuid, String)>,
     pending_notes: HashMap<(PathBuf, Uuid), PendingNote>,
     closing: bool,
+    close_note_dialog: bool,
     tag_draft: Option<String>,
     add_tags_draft: Option<AddTagsDraft>,
     delete_folder: Option<Uuid>,
@@ -749,6 +750,7 @@ impl Desktop {
             notes_draft: None,
             pending_notes: HashMap::new(),
             closing: false,
+            close_note_dialog: false,
             tag_draft: None,
             add_tags_draft: None,
             delete_folder: None,
@@ -857,7 +859,9 @@ impl Desktop {
                 self.receive_recents(recents);
             }
             Ok(Update::Found(browse, rows)) => {
-                self.query.clone_from(&browse.query);
+                if self.browse.view != browse.view {
+                    self.query.clone_from(&browse.query);
+                }
                 self.browse = browse;
                 self.replace_rows(rows);
                 self.announcement = Some(format!("{} results", self.rows.len()));
@@ -927,7 +931,10 @@ impl Desktop {
                         if let Some(note) = self.pending_notes.get_mut(&key) {
                             note.due = Instant::now() + Duration::from_secs(2);
                         }
-                        self.closing = false;
+                        if self.closing {
+                            self.closing = false;
+                            self.close_note_dialog = true;
+                        }
                         self.failure(format!("Could not save note: {error}"));
                     }
                 }
@@ -1020,6 +1027,17 @@ impl Desktop {
     }
 
     fn replace_rows(&mut self, rows: Vec<Row>) {
+        for row in &rows {
+            self.previews.observe(
+                &row.asset.path,
+                row.file
+                    .as_ref()
+                    .map(|file| craft::browse::thumbs::FileStat {
+                        len: file.bytes,
+                        modified: file.modified,
+                    }),
+            );
+        }
         self.positions = rows
             .iter()
             .enumerate()
@@ -1082,7 +1100,7 @@ impl Desktop {
 
     fn add_button(&mut self, ui: &mut Ui) {
         if chrome_icon("plus", "Add files")
-            .enabled(self.idle() && self.browse.view != AssetView::Trash)
+            .enabled(self.can_import())
             .show(ui)
             .clicked()
         {
@@ -1091,6 +1109,10 @@ impl Desktop {
                 PickRequest::open_many("add-files").title("Add files"),
             );
         }
+    }
+
+    fn can_import(&self) -> bool {
+        self.idle() && self.library.is_some() && self.browse.view != AssetView::Trash
     }
 
     fn navigation(&mut self, ui: &mut Ui) {
@@ -1243,12 +1265,13 @@ impl Desktop {
         let create = Cell::new(false);
         let cancel = Cell::new(false);
         let draft_icon = Cell::new(None);
+        let can_drop = idle && self.browse.view != AssetView::Trash;
         let mut list = List::new(Word::plain("Custom folders"))
             .tree(true)
             .natural_height(true)
             .takes_drop(DropKind::new::<DraggedAssets>(
                 DropPlace::Onto,
-                move |_, at| idle && matches!(at, DropAt::Onto(id) if *id != DRAFT_FOLDER),
+                move |_, at| can_drop && matches!(at, DropAt::Onto(id) if *id != DRAFT_FOLDER),
             ))
             .activate(ActivateOn::Click)
             .selection(Bind::given(selection))
@@ -1397,7 +1420,7 @@ impl Desktop {
                     at: DropAt::Onto(id),
                     payload,
                     ..
-                } if id != DRAFT_FOLDER => {
+                } if can_drop && id != DRAFT_FOLDER => {
                     if let Some(assets) = payload.get::<DraggedAssets>() {
                         self.edit_metadata(
                             assets.0.clone(),
@@ -2550,7 +2573,9 @@ impl Desktop {
     }
 
     fn import_window_drop(&mut self, drop: &OsFiles) {
-        if self.idle()
+        if self.browse.view == AssetView::Trash {
+            self.failure("Open another view before adding files".to_owned());
+        } else if self.can_import()
             && self.library_draft.is_none()
             && self.delete_folder.is_none()
             && let Some(library) = &self.library
@@ -2572,6 +2597,53 @@ impl Desktop {
             self.failure(
                 "Open a library and finish the current action before dropping files".to_owned(),
             );
+        }
+    }
+
+    fn unsaved_notes_dialog(&mut self, ui: &mut Ui) {
+        if !self.close_note_dialog {
+            return;
+        }
+        let mut open = true;
+        let shown = Dialog::prompt(Word::plain("Notes could not be saved"))
+            .opened(Bind::bound(&mut open))
+            .buttons([
+                FooterButton::new(Word::plain("Retry saving"), DialogRole::Accept),
+                FooterButton::new(Word::plain("Discard and close"), DialogRole::Destructive),
+                FooterButton::new(Word::plain("Cancel"), DialogRole::Cancel),
+            ])
+            .show(ui, |ui, _| {
+                Text::new(Word::plain(
+                    "Retry saving, or copy the unsaved notes before closing.",
+                ))
+                .show(ui);
+                if Button::new(Word::plain("Copy unsaved notes"))
+                    .show(ui)
+                    .clicked()
+                {
+                    let mut notes: Vec<_> = self.pending_notes.iter().collect();
+                    notes.sort_by_key(|(key, _)| *key);
+                    let text = notes
+                        .into_iter()
+                        .map(|((path, id), note)| {
+                            format!("{} · {id}\n{}", path.display(), note.text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    ui.ctx().copy_text(text);
+                }
+            });
+        if shown.output.closed.is_some() {
+            self.close_note_dialog = false;
+            match shown.output.picked {
+                Some(0) => self.closing = true,
+                Some(1) => {
+                    self.pending_notes.clear();
+                    self.closing = true;
+                }
+                _ => {}
+            }
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2918,7 +2990,7 @@ impl ShellApp for Desktop {
     }
 
     fn tick(&mut self, now: Instant) -> Option<Instant> {
-        if !self.idle() {
+        if !self.idle() || self.close_note_dialog {
             return None;
         }
         let (key, note) = self.pending_notes.iter().min_by_key(|(_, note)| note.due)?;
@@ -2936,7 +3008,7 @@ impl ShellApp for Desktop {
         if self.pending_notes.is_empty() {
             CloseDecision::Close
         } else {
-            self.closing = true;
+            self.closing = !self.close_note_dialog;
             CloseDecision::Hold
         }
     }
@@ -2990,6 +3062,7 @@ impl ShellApp for Desktop {
         self.folder_delete_dialog(ui);
         self.manage_tags_dialog(ui);
         self.add_tags_dialog(ui);
+        self.unsaved_notes_dialog(ui);
         if self.closing && self.pending_notes.is_empty() {
             ui.ctx().send_viewport_cmd(ViewportCommand::Close);
         } else if self.closing && self.idle() {
