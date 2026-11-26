@@ -32,7 +32,7 @@ Statuses are `PROPOSED`, `UNDER REVIEW`, `APPROVED`, `REJECTED`, `DEFERRED`, and
 | SC-01b | PROPOSED | Add Waterfall to the shared Craft `TileGrid`, with a local test gate before any upstream publication. [Candidate design and checks](../research/artcraft-alignment.md#sc-01b-waterfall-in-tilegrid). | The owner requested an upstream proposal and tests before any push. The implementation design and publication remain pending. |
 | SC-02 | APPROVED | Use the Craft column start page with Create, Open and a list of previously opened libraries when available. Use integrated platform window controls. [Implementation and checks](../research/artcraft-alignment.md#sc-02-start-page-and-recent-libraries) | The owner requested a mockup and implementation, then approved the mockup and requested integrated controls. |
 | D10 | APPROVED | Start the public compatibility contract at catalog schema version 6 and the AssetCraft settings namespace. Preserve the version 6 format already used by current catalogs. | The owner clarified that compatibility starts with the first public version. |
-| D11 | APPROVED | Publish the source preview as `Carbocode/assetcraft` on GitHub under Apache-2.0. | The owner replied “Confermo repository e Apache-2.0” to the publication and license question. |
+| D11 | APPROVED | Publish the source preview as `Carbocode/AssetCraft` on GitHub under Apache-2.0. | The owner replied “Confermo repository e Apache-2.0” to the publication and license question. |
 
 Future architectural decision records belong under `docs/decisions/adr/`.
 
