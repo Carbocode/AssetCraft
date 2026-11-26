@@ -257,6 +257,37 @@ fn catalog_creation_preserves_existing_sidecars() {
 }
 
 #[test]
+fn concurrent_catalog_creation_keeps_the_winner() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join(CATALOG);
+    let barrier = std::sync::Barrier::new(2);
+    let results = thread::scope(|scope| {
+        ["First library", "Second library"]
+            .map(|name| {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    block_on(async {
+                        let catalog = Catalog::create(path, name).await?;
+                        catalog.close().await?;
+                        Ok::<_, assetcraft::Error>(name)
+                    })
+                })
+            })
+            .map(|thread| thread.join().unwrap())
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    block_on(async {
+        let catalog = Catalog::open(&path).await.unwrap();
+        assert_eq!(catalog.library().name, winner);
+        catalog.close().await.unwrap();
+    });
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+}
+
+#[test]
 fn killing_a_cli_batch_during_a_write_preserves_committed_assets() {
     let fixture = Fixture::new();
     fixture.create();

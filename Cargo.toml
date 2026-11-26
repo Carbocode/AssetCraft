@@ -27,6 +27,7 @@ futures-executor = "=0.3.32"
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
 sha2 = "=0.10.9"
 sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite-bundled", "sqlite-deserialize"] }
+tempfile = "=3.27.0"
 uuid = { version = "=1.27.0", default-features = false, features = ["v4"] }
 
 [[test]]

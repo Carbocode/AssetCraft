@@ -257,6 +257,7 @@ dependencies = [
  "serde",
  "sha2",
  "sqlx",
+ "tempfile",
  "uuid",
 ]
 

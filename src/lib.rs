@@ -4,7 +4,7 @@
 pub mod local_file;
 
 use chrono::Utc;
-use craft::atomic::{AtomicFs, NewFilePermissions, RealFs};
+use craft::atomic::{AtomicFs, RealFs};
 use craft::sniff::{HEAD, Kind, identify};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteSynchronous};
@@ -809,21 +809,14 @@ fn ensure_catalog_destination_unused(path: &Path) -> io::Result<()> {
 
 fn publish_catalog(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
-    let stage = parent.join(format!(".assetcraft-{}.tmp", Uuid::new_v4()));
-    let mut file = RealFs.create_new(&stage, NewFilePermissions::Private)?;
-    let written = file.write_all(bytes).and_then(|()| RealFs.sync(&file));
-    drop(file);
-    let result = written.and_then(|()| {
-        ensure_catalog_destination_unused(path)?;
-        // A hard link publishes a complete file and cannot replace an existing destination.
-        RealFs.hard_link(&stage, path)
-    });
-    let _ = RealFs.remove(&stage);
-    if result.is_ok() {
-        // Publication has completed. A directory sync is best effort, as in craft-atomic.
-        let _ = RealFs.sync_dir(parent);
-    }
-    result
+    let mut stage = tempfile::NamedTempFile::with_prefix_in(".assetcraft-", parent)?;
+    stage.write_all(bytes)?;
+    RealFs.sync(stage.as_file())?;
+    ensure_catalog_destination_unused(path)?;
+    drop(stage.persist_noclobber(path)?);
+    // Publication has completed. A directory sync is best effort, as in craft-atomic.
+    let _ = RealFs.sync_dir(parent);
+    Ok(())
 }
 
 fn check_header(path: &Path) -> Result<(), Error> {

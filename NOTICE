@@ -2,3 +2,5 @@ AssetCraft uses jpeg-encoder 0.6.1 through Craft Image Codecs.
 Copyright (c) 2021 Volker Ströbel.
 
 This software is based in part on the work of the Independent JPEG Group.
+
+AssetCraft uses tempfile 3.27.0 under the Apache License, Version 2.0.
