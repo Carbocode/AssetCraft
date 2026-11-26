@@ -1997,6 +1997,7 @@ impl Desktop {
             .buttons(buttons)
             .settle_buttons(|_, buttons| buttons[0].set_enabled(idle && has_selection.get()))
             .show(ui, |ui, _| {
+                set_tag_dialog_width(ui);
                 let height = Env::of(ui).tokens.size.control.sm;
                 let gap = ui.spacing().item_spacing.y;
                 craft::egui::ScrollArea::vertical()
@@ -2065,6 +2066,7 @@ impl Desktop {
             .opened(Bind::bound(&mut open))
             .buttons(buttons)
             .show(ui, |ui, _| {
+                set_tag_dialog_width(ui);
                 if let Some(status) = &self.status {
                     Notice::new(status.tone, status.summary.clone()).show(ui);
                 }
@@ -2777,6 +2779,11 @@ impl Desktop {
 
 fn format_local_date(date: chrono::DateTime<chrono::Local>) -> String {
     date.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn set_tag_dialog_width(ui: &mut Ui) {
+    let width = Env::of(ui).tokens.size.dialog.wrap;
+    ui.set_width(width.min(ui.available_width()));
 }
 
 fn membership_chip(
