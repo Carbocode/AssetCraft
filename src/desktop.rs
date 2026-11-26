@@ -2051,6 +2051,8 @@ impl Desktop {
     }
 
     fn manage_tags_dialog(&mut self, ui: &mut Ui) {
+        const TAG_NAME: ColumnKey = ColumnKey::new("tag-name");
+        const TAG_USES: ColumnKey = ColumnKey::new("tag-uses");
         let visible = self.tag_draft.is_some() && self.library.is_some();
         let mut open = visible;
         let idle = self.idle();
@@ -2080,13 +2082,23 @@ impl Desktop {
                 let entries: Vec<_> = self.organization.tags.iter().collect();
                 let source = keyed(&entries, |(tag, _)| (*tag).clone())
                     .with_text(|(tag, _)| Cow::Borrowed(tag.as_str()));
+                let columns = vec![
+                    ColumnSpec::new(TAG_NAME, Word::plain("Tag"), ColumnWidth::fill(1.0)),
+                    ColumnSpec::new(TAG_USES, Word::plain("Uses"), ColumnWidth::Content),
+                ];
                 List::new(Word::plain("Library tags"))
+                    .columns(columns)
+                    .header(false)
                     .natural_height(true)
                     .max_rows(8)
                     .empty(Word::plain("No tags in this library"))
                     .sizing(Sizing::FillWidth)
-                    .show_items(ui, &source, &mut |tag, _| {
-                        ListRow::new(tag.clone()).trailing(self.organization.tags[tag].to_string())
+                    .show_items(ui, &source, &mut |tag, cx| {
+                        ListRow::new(tag.clone())
+                            .cells(cx.cells())
+                            .cell(TAG_USES, self.organization.tags[tag].to_string())
+                            .cell_muted(TAG_USES)
+                            .tooltip(tag.clone())
                     });
                 entered
             });
