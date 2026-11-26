@@ -4,6 +4,7 @@
 pub mod local_file;
 
 use chrono::Utc;
+use craft::atomic::{AtomicFs, NewFilePermissions, RealFs};
 use craft::sniff::{HEAD, Kind, identify};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteSynchronous};
@@ -12,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -225,11 +226,7 @@ impl Catalog {
             return Err(Error::EmptyName);
         }
         let path = database_path(path)?;
-        match fs::symlink_metadata(&path) {
-            Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists).into()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        ensure_catalog_destination_unused(&path)?;
         // Initialize privately so a failed SQL operation leaves no destination behind.
         let mut db =
             SqliteConnection::connect_with(&catalog_options().filename(":memory:").in_memory(true))
@@ -253,9 +250,7 @@ impl Catalog {
         transaction.commit().await?;
         let bytes = db.serialize(None).await?;
         db.close().await?;
-        craft::atomic::WriteOptions::default()
-            .with_new_file_permissions(craft::atomic::NewFilePermissions::Private)
-            .write_new(&path, &bytes)?;
+        publish_catalog(&path, &bytes)?;
         Self::open(&path).await
     }
 
@@ -788,6 +783,47 @@ fn database_path(path: &Path) -> Result<PathBuf, Error> {
         );
     }
     Ok(path)
+}
+
+fn ensure_catalog_destination_unused(path: &Path) -> io::Result<()> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = Path::new(&candidate);
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Catalog destination or SQLite sidecar already exists: {}",
+                        candidate.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn publish_catalog(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let stage = parent.join(format!(".assetcraft-{}.tmp", Uuid::new_v4()));
+    let mut file = RealFs.create_new(&stage, NewFilePermissions::Private)?;
+    let written = file.write_all(bytes).and_then(|()| RealFs.sync(&file));
+    drop(file);
+    let result = written.and_then(|()| {
+        ensure_catalog_destination_unused(path)?;
+        // A hard link publishes a complete file and cannot replace an existing destination.
+        RealFs.hard_link(&stage, path)
+    });
+    let _ = RealFs.remove(&stage);
+    if result.is_ok() {
+        // Publication has completed. A directory sync is best effort, as in craft-atomic.
+        let _ = RealFs.sync_dir(parent);
+    }
+    result
 }
 
 fn check_header(path: &Path) -> Result<(), Error> {

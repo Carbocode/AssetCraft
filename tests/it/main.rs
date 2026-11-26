@@ -239,6 +239,24 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
 }
 
 #[test]
+fn catalog_creation_preserves_existing_sidecars() {
+    let fixture = Fixture::new();
+    for suffix in ["journal", "wal", "shm"] {
+        let sidecar = format!("{CATALOG}-{suffix}");
+        fixture.write(&sidecar, b"existing file");
+        let output = fixture.run(["create", CATALOG, "Library"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SQLite sidecar already exists"));
+        let sidecar = fixture.0.join(sidecar);
+        assert_eq!(fs::read(&sidecar).unwrap(), b"existing file");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+        fs::remove_file(sidecar).unwrap();
+    }
+    fixture.create();
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+}
+
+#[test]
 fn killing_a_cli_batch_during_a_write_preserves_committed_assets() {
     let fixture = Fixture::new();
     fixture.create();
