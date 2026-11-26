@@ -34,15 +34,30 @@ jobs:
           Windows/X64) platform=windows-x86_64; extension=.exe ;;
           *) echo "Unsupported runner $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
         esac
-        cargo build --release --locked --features desktop --bins
+        build_dir=release
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          target=x86_64-pc-windows-msvc
+          RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static" \
+            cargo build --release --locked --features desktop --bins --target "$target"
+          build_dir="$target/release"
+        else
+          cargo build --release --locked --features desktop --bins
+        fi
         mkdir -p target/release-preview/{staging,packages}
         cd target/release-preview
         cp ../../LICENSE ../../NOTICE ../../ATTRIBUTION.md ../../README.md staging/
-        cp "../release/assetcraft-cli$extension" "../release/assetcraft-desktop$extension" staging/
+        cp "../$build_dir/assetcraft-cli$extension" "../$build_dir/assetcraft-desktop$extension" staging/
         "./staging/assetcraft-cli$extension" --help
         if [[ "$RUNNER_OS" == Windows ]]; then
           powershell.exe -NoProfile -NonInteractive -Command \
-            'Compress-Archive -Path staging/* -DestinationPath packages/assetcraft-windows-x86_64.zip -Force -ErrorAction Stop'
+            '$ErrorActionPreference = "Stop"; Compress-Archive -Path staging/* -DestinationPath packages/assetcraft-windows-x86_64.zip -Force; Expand-Archive -Path packages/assetcraft-windows-x86_64.zip -DestinationPath extracted -Force'
+          for executable in extracted/assetcraft-{cli,desktop}.exe; do
+            imports=$(llvm-objdump -p "$executable")
+            if grep -Ei 'DLL Name:[[:space:]]*(vcruntime|msvcp|concrt|vcomp)' <<<"$imports"; then
+              echo "$executable requires a Visual C++ runtime DLL" >&2
+              exit 1
+            fi
+          done
         else
           tar -czf "packages/assetcraft-$platform.tar.gz" -C staging .
         fi
