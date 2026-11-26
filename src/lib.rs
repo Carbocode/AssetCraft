@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[doc(hidden)]
+pub mod local_file;
+
 use chrono::Utc;
 use craft::sniff::{HEAD, Kind, identify};
 use sha2::{Digest, Sha256};
@@ -10,7 +13,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -222,11 +225,11 @@ impl Catalog {
             return Err(Error::EmptyName);
         }
         // Reserve the destination exclusively before SQLite opens it.
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options.open(path)?;
         let mut db = connect(path).await?;
         let library = Library {
             id: Uuid::new_v4(),
@@ -352,7 +355,7 @@ impl Catalog {
                         "INSERT INTO asset VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO NOTHING",
                     )
                     .bind(asset.id.as_bytes().as_slice())
-                    .bind(asset.path.as_os_str().as_bytes())
+                    .bind(local_file::encode_path(&asset.path))
                     .bind(&asset.display_name)
                     .bind(asset.format.as_str())
                     .bind(asset.sha256_at_import.as_slice())
@@ -809,7 +812,7 @@ fn resolve_file(path: &Path) -> Result<PathBuf, Error> {
 }
 
 fn inspect_file(path: PathBuf) -> Result<Asset, Error> {
-    let mut file = File::open(&path)?;
+    let mut file = local_file::open_read(&path)?;
     let before = file.metadata()?;
     if !before.is_file() {
         return Err(Error::NotARegularFile);
@@ -825,10 +828,12 @@ fn inspect_file(path: PathBuf) -> Result<Asset, Error> {
     digest.update(head);
     io::copy(&mut file, &mut digest)?;
     let after = fs::metadata(&path)?;
+    if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(Error::FileChanged);
+    }
+    #[cfg(unix)]
     if before.dev() != after.dev()
         || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.modified()? != after.modified()?
         || before.ctime() != after.ctime()
         || before.ctime_nsec() != after.ctime_nsec()
     {
@@ -854,7 +859,7 @@ async fn find_path(db: &mut SqliteConnection, path: &Path) -> Result<Option<Asse
         "SELECT id, path, display_name, format, sha256_at_import, imported_at_unix_ms
          FROM asset WHERE path = ?",
     )
-    .bind(path.as_os_str().as_bytes())
+    .bind(local_file::encode_path(path))
     .fetch_optional(db)
     .await?
     .as_ref()
@@ -873,10 +878,7 @@ fn read_asset(row: &sqlx::sqlite::SqliteRow) -> Result<Asset, Error> {
         _ => return Err(Error::InvalidRecord("format")),
     };
     let bytes: Vec<u8> = row.try_get("path")?;
-    let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
-    if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
-        return Err(Error::InvalidRecord("path"));
-    }
+    let path = local_file::decode_path(bytes).ok_or(Error::InvalidRecord("path"))?;
     Ok(Asset {
         id: read_id(row)?,
         path,

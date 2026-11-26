@@ -26,7 +26,9 @@ use sqlx::Connection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -177,10 +179,13 @@ fn duplicate_locations_and_partial_failures_have_distinct_outcomes() {
 }
 
 #[test]
-fn non_utf8_paths_round_trip_and_missing_originals_remain_searchable() {
+fn native_paths_round_trip_and_missing_originals_remain_searchable() {
     let fixture = Fixture::new();
     fixture.create();
+    #[cfg(target_os = "linux")]
     let name = OsString::from_vec(b"unusual-\xff.png".to_vec());
+    #[cfg(not(target_os = "linux"))]
+    let name = OsString::from("unusual-素材-📷.png");
     fixture.write(&name, PNG);
     let added = stdout(fixture.run([OsStr::new("add"), OsStr::new(CATALOG), &name]));
     let id = added.split('\t').nth(1).unwrap();
@@ -271,7 +276,9 @@ fn killing_a_cli_batch_rolls_back_its_first_insert() {
     let _ = child.kill();
     let output = child.wait_with_output().unwrap();
     assert!(reached_write, "{}", String::from_utf8_lossy(&output.stderr));
+    #[cfg(unix)]
     assert_eq!(output.status.signal(), Some(9));
+    assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(fixture.ok(&["find", CATALOG, ""]), previous);
 }
