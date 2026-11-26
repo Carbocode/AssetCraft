@@ -1,0 +1,24 @@
+name: Native platform checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@4ec2a14646b538253fd5ebe109bf463a3d31b061
+    with:
+      os: '["macos-15","windows-2025"]'
+      craft-fonts-ref: ""
+      targets: ""
+      tools: ""
+      command: |
+        set -e
+        cargo clippy --locked --features desktop --all-targets -- -D warnings
+        cargo test --locked --features desktop
+        cargo build --locked --features desktop --bins
