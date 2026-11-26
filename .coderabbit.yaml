@@ -2,6 +2,6 @@
 reviews:
   auto_review:
     enabled: true
-    drafts: false
-    ignore_usernames:
-      - "dependabot[bot]"
+    drafts: true
+    base_branches:
+      - ".*"

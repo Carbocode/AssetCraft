@@ -43,7 +43,7 @@ See [repository guidance](AGENTS.md) and [third-party attribution](ATTRIBUTION.m
 
 Push a version tag such as `v0.1.0` or run **Release preview** from GitHub Actions. The workflow builds the Linux desktop and CLI in release mode and uploads a tarball and SHA-256 checksums as an Actions artifact. Preview archives can be tested before publishing a GitHub release.
 
-CodeRabbit is configured to review pull requests when they are ready for review. Enable the CodeRabbit GitHub App for this repository to use automated reviews.
+The CodeRabbit GitHub App reviews pull requests automatically, including drafts.
 
 ## License
 

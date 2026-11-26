@@ -12,11 +12,11 @@ permissions:
   contents: read
 
 jobs:
-  git-sources:
+  preview-git-sources:
     uses: storytold/craft-common-actions/.github/workflows/git-sources.yml@4ec2a14646b538253fd5ebe109bf463a3d31b061
 
-  linux:
-    needs: git-sources
+  preview-linux:
+    needs: preview-git-sources
     uses: storytold/craft-common-actions/.github/workflows/gate.yml@4ec2a14646b538253fd5ebe109bf463a3d31b061
     with:
       os: '["ubuntu-24.04"]'
