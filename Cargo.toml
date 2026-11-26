@@ -1,0 +1,46 @@
+[package]
+name = "assetcraft"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/Carbocode/assetcraft"
+publish = false
+
+[[bin]]
+name = "assetcraft-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "assetcraft-desktop"
+path = "src/desktop.rs"
+required-features = ["desktop"]
+
+[features]
+desktop = ["craft/ui-app", "craft/dialogs", "craft/image-codecs", "craft/settings", "craft/window", "dep:eframe", "dep:serde"]
+
+[dependencies]
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+craft = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7", default-features = false, features = ["sniff"] }
+eframe = { version = "=0.37.0", optional = true, default-features = false, features = ["accesskit"] }
+futures-executor = "=0.3.32"
+serde = { version = "=1.0.229", features = ["derive"], optional = true }
+sha2 = "=0.10.9"
+sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite-bundled"] }
+uuid = { version = "=1.27.0", default-features = false, features = ["v4"] }
+
+[[test]]
+name = "integration"
+path = "tests/it/main.rs"
+
+[patch.crates-io]
+ecolor = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+emath = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+epaint = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+egui = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+egui-winit = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+egui_glow = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+eframe = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
+winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
