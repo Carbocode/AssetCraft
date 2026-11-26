@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/Carbocode/AssetCraft/actions/workflows/ci.yml"><img src="https://github.com/Carbocode/AssetCraft/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-3a3a3a?style=flat-square" alt="Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/status-Linux%20preview-236b87?style=flat-square" alt="Linux preview">
+  <img src="https://img.shields.io/badge/status-preview-236b87?style=flat-square" alt="Preview">
 </p>
 
 <p align="center">
@@ -33,7 +33,9 @@
 
 ## Get started
 
-The current source preview targets Linux. Install Rust 1.95 or newer, a C compiler and the native windowing libraries listed in the [Linux CI workflow](.github/workflows/ci.yml).
+Pre-release archives are available for Linux x64, macOS Apple Silicon and Windows x64 on the [Releases page](https://github.com/Carbocode/AssetCraft/releases). Extract the archive and run `assetcraft-desktop` from the extracted directory (`assetcraft-desktop.exe` on Windows). The archives contain unsigned preview builds.
+
+To build from source, install Rust 1.95 or newer and the platform C toolchain. On Linux, also install the native windowing libraries listed in the [Linux CI workflow](.github/workflows/ci.yml).
 
 ```sh
 cargo run --locked --features desktop --bin assetcraft-desktop
@@ -70,7 +72,7 @@ cargo test --locked --features desktop
 
 ### Release previews
 
-Push a version tag such as `v0.1.0` or run **Release preview** from GitHub Actions. The workflow builds the Linux desktop and CLI in release mode and uploads a tarball and SHA-256 checksums as an Actions artifact. Preview archives can be tested before publishing a GitHub release.
+Run **Release preview** from GitHub Actions to build archives for all three platforms without publishing. Pushing a version tag that matches `Cargo.toml`, such as `v0.1.0`, runs the same builds and publishes a GitHub pre-release with the three archives and `SHA256SUMS` after all builds pass.
 
 ## License
 
