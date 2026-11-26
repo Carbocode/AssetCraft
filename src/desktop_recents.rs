@@ -1,9 +1,7 @@
-use assetcraft::{Appearance, Library};
+use assetcraft::{Appearance, Library, local_file};
 use craft::settings::{Location, MergeRule, Settings, SettingsError, SettingsStore};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const LIMIT: usize = 12;
 
@@ -12,12 +10,13 @@ pub struct RecentLibrary {
     pub name: String,
     #[serde(default)]
     pub appearance: Appearance,
-    path: Vec<u8>,
+    #[serde(with = "recent_path")]
+    path: PathBuf,
 }
 
 impl RecentLibrary {
     pub fn path(&self) -> &Path {
-        Path::new(OsStr::from_bytes(&self.path))
+        &self.path
     }
 }
 
@@ -71,11 +70,26 @@ pub fn remember(path: &Path, library: &Library) -> Result<Vec<RecentLibrary>, Se
             RecentLibrary {
                 name: library.name.clone(),
                 appearance: library.appearance.clone(),
-                path: path.as_os_str().as_bytes().to_vec(),
+                path: path.to_path_buf(),
             },
         );
         settings.recent_libraries.truncate(LIMIT);
     });
     store.flush()?;
     Ok(store.get().recent_libraries.clone())
+}
+
+mod recent_path {
+    use super::{Path, PathBuf, local_file};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        local_file::encode_path(path).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        local_file::decode_path(bytes)
+            .ok_or_else(|| serde::de::Error::custom("Invalid library path"))
+    }
 }

@@ -1,3 +1,4 @@
+use assetcraft::local_file;
 use craft::behavior::{IconId, PixelSize};
 use craft::browse::thumbs::{
     DecodeRequest, DecodedThumb, FileThumbKey, FileThumbSource, ThumbDecoder, ThumbError,
@@ -18,14 +19,11 @@ use craft::ui::primitives::textures::{
 };
 use craft::ui::primitives::{ContentPainterCx, IconSpec};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const LINUX_NONBLOCKING: i32 = 0o4000;
 const LIMITS: Limits = Limits {
     max_width: 32_768,
     max_height: 32_768,
@@ -92,12 +90,8 @@ impl ThumbDecoder for ImageDecoder {
 }
 
 fn read_original(path: &Path) -> Result<Vec<u8>, ThumbError> {
-    // Opening without blocking lets us reject a path that was replaced with a FIFO.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(LINUX_NONBLOCKING)
-        .open(path)
-        .map_err(|error| ThumbError::Failed(error.to_string()))?;
+    let file =
+        local_file::open_read(path).map_err(|error| ThumbError::Failed(error.to_string()))?;
     let metadata = file
         .metadata()
         .map_err(|error| ThumbError::Failed(error.to_string()))?;
@@ -110,7 +104,7 @@ fn read_original(path: &Path) -> Result<Vec<u8>, ThumbError> {
         ));
     }
     let mut bytes = Vec::new();
-    File::take(file, MAX_FILE_BYTES + 1)
+    file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| ThumbError::Failed(error.to_string()))?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
