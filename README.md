@@ -58,7 +58,9 @@ Create a catalog at an unused destination. The CLI identifies PNG and JPEG by fi
 
 ## Under the hood
 
-The Rust CLI and desktop share the SQLx catalog. The desktop uses the Craft Framework for the application shell, theme, dialogs, and shared browsing components. The public catalog format starts at version 6. Catalogs from earlier development builds need to be recreated.
+The Rust CLI and desktop share the SQLx catalog. The desktop uses the Craft Framework for the application shell, theme, dialogs, and shared browsing components. Opening a version 6 or 7 catalog upgrades it to version 8, which preserves point-comment IDs and prevents their reuse after deletion. Catalogs older than version 6 need to be recreated.
+
+In the image viewer, switch on **Add point comment** in the toolbar, click a point on the image, and write and save your comment in the popup. The tool stays active so you can annotate more points. Numbered bubbles follow the creation order on each image. Click a bubble to read, edit, or delete the comment, or drag it to move the anchor. The numbers close up after a deletion. From the CLI, `comment-add <catalog> <asset-id> <relative-x> <relative-y> <text>` adds a point comment, and `comments <catalog> <asset-id>` lists the saved comments. Use the ID returned by that list with `comment-edit`, `comment-move`, and `comment-delete`. Coordinates run from 0 to 1, starting from the top-left of the image.
 
 ## Contributing
 

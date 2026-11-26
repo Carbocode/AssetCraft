@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod desktop_comments;
 mod desktop_recents;
 mod desktop_thumbnails;
+mod desktop_viewer;
 
 use assetcraft::{
     Added, Appearance, Asset, AssetState, AssetView, Catalog, Error, Folder, Format, Library,
@@ -24,13 +26,13 @@ use craft::theme::{LabelColor, ModeChoice, ThemeId, TypeRole};
 use craft::ui::buttons::{Button, IconButton};
 use craft::ui::choice::{Checkbox, Rating, Segmented, Switch};
 use craft::ui::contract::{
-    ActivateOn, Bind, CollectionEvent, ColumnSpec, DropAt, DropKind, DropPlace, Entry, PaneEdge,
-    Props, RowHeight, RowPreview, SelectMode, ShellPane, Show, ShowCollection, ShowContainer,
-    Sizing, Trigger,
+    ActivateOn, Bind, CollectionEvent, ColumnSpec, DropAt, DropKind, DropPlace, Entry, Pad,
+    PaneEdge, Props, RowHeight, RowPreview, Scroll, SelectMode, ShellPane, Show, ShowCollection,
+    ShowContainer, Sizing, Trigger,
 };
 use craft::ui::dialog::{Dialog, DialogHost};
 use craft::ui::display::{Divider, Elide, Icon, Picture, Shade, Text};
-use craft::ui::layout_components::Row as ControlRow;
+use craft::ui::layout_components::{Row as ControlRow, Stack};
 use craft::ui::list::{List, ListRow, ListWords, OpenSet, ThumbAspect, label_color_label};
 use craft::ui::menu::{Menu, MenuItem};
 use craft::ui::notices::Notice;
@@ -58,8 +60,10 @@ use craft::window::Prefix;
 use craft::window::policy::{
     Backend, Frame as WindowFrame, Os, Runtime, TitleBarPref, WindowKind, decide, decide_for,
 };
+use desktop_comments::{CommentChange, CommentEdit};
 use desktop_recents::RecentLibrary;
 use desktop_thumbnails::{PreviewSurface, Previews};
+use desktop_viewer::{Viewer, ViewerAction};
 use futures_executor::block_on;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -91,6 +95,7 @@ enum Operation {
     DeleteFolder(PathBuf, Uuid, Browse),
     CreateTag(PathBuf, String),
     SaveNote(PathBuf, Uuid, String),
+    EditComment(PathBuf, Uuid, CommentEdit),
 }
 
 enum AssetEdit {
@@ -211,13 +216,14 @@ fn appearance_menu(ui: &mut Ui, current: &Appearance) -> Option<Appearance> {
     (appearance != *current).then_some(appearance)
 }
 
-const DEFAULT_VIEWS: [(AssetView, &str, &str); 6] = [
-    (AssetView::All, "All assets", "layout_grid"),
-    (AssetView::Random, "Random", "refresh"),
-    (AssetView::Recent, "Recently added", "clock"),
-    (AssetView::Favorites, "Favorites", "star"),
-    (AssetView::Untagged, "Untagged", "bookmark"),
-    (AssetView::Trash, "Trash", "trash"),
+const NAVIGATION_ITEMS: [(Option<AssetView>, &str, &str); 7] = [
+    (Some(AssetView::All), "All assets", "layout_grid"),
+    (Some(AssetView::Random), "Random", "refresh"),
+    (Some(AssetView::Recent), "Recently added", "clock"),
+    (Some(AssetView::Favorites), "Favorites", "star"),
+    (Some(AssetView::Untagged), "Untagged", "bookmark"),
+    (None, "All Tags", "bookmark"),
+    (Some(AssetView::Trash), "Trash", "trash"),
 ];
 
 struct FolderTree<'a> {
@@ -365,6 +371,7 @@ enum Update {
     FolderDeleted(Vec<Folder>, Browse, Vec<Row>, Organization),
     TagCreated(Organization),
     NoteSaved(PathBuf, Uuid, String, Result<(), Error>),
+    CommentChanged(Uuid, Option<i64>, Result<CommentChange, Error>),
 }
 
 impl Operation {
@@ -455,6 +462,33 @@ impl Operation {
                 }
                 .await;
                 Ok(Update::NoteSaved(path, id, text, result))
+            }
+            Self::EditComment(path, asset, edit) => {
+                let retry = match &edit {
+                    CommentEdit::Move(id, _) => Some(*id),
+                    _ => None,
+                };
+                let result = async {
+                    let mut catalog = Catalog::open(&path).await?;
+                    let change = match edit {
+                        CommentEdit::Add(point, body) => CommentChange::Upsert(
+                            catalog.add_point_comment(asset, point, &body).await?,
+                        ),
+                        CommentEdit::Text(id, body) => CommentChange::Upsert(
+                            catalog.edit_point_comment(asset, id, &body).await?,
+                        ),
+                        CommentEdit::Move(id, point) => CommentChange::Upsert(
+                            catalog.move_point_comment(asset, id, point).await?,
+                        ),
+                        CommentEdit::Delete(id) => {
+                            catalog.delete_point_comment(asset, id).await?;
+                            CommentChange::Deleted(id)
+                        }
+                    };
+                    Ok(change)
+                }
+                .await;
+                Ok(Update::CommentChanged(asset, retry, result))
             }
             Self::Metadata(path, assets, edit, browse) => {
                 let mut catalog = Catalog::open(&path).await?;
@@ -700,6 +734,8 @@ struct Desktop {
     status: Option<Status>,
     announcement: Option<String>,
     previews: Previews,
+    viewer: Viewer,
+    restore_grid_focus: bool,
     selection: Selection<Uuid>,
     display: DisplayMode,
     zoom: f64,
@@ -729,7 +765,8 @@ impl Desktop {
             lanes: 1,
             ..QueueOptions::default()
         };
-        let queue = JobQueue::new(host.jobs_shared().clone(), wake, options);
+        let queue = JobQueue::new(host.jobs_shared().clone(), wake.clone(), options);
+        let viewer = Viewer::new(&host, wake);
         Self {
             host,
             environment: RootEnv::default().mode(ModeChoice::System).theme(
@@ -761,6 +798,8 @@ impl Desktop {
             status: None,
             announcement: None,
             previews,
+            viewer,
+            restore_grid_focus: false,
             selection: Selection::default(),
             display: DisplayMode::default(),
             zoom: TileZoom::Ladder.default_value(),
@@ -842,6 +881,8 @@ impl Desktop {
             Ok(Update::Opened(library, rows, folders, organization, recents)) => {
                 self.library = Some(library);
                 self.previews.clear();
+                self.viewer.close();
+                self.restore_grid_focus = false;
                 self.selection = Selection::default();
                 self.library_draft = None;
                 self.query.clear();
@@ -861,6 +902,10 @@ impl Desktop {
             Ok(Update::Found(browse, rows)) => {
                 if self.browse.view != browse.view {
                     self.query.clone_from(&browse.query);
+                    if self.viewer.asset().is_some() {
+                        self.viewer.close();
+                        self.restore_grid_focus = true;
+                    }
                 }
                 self.browse = browse;
                 self.replace_rows(rows);
@@ -907,6 +952,19 @@ impl Desktop {
                     draft.clear();
                 }
                 self.announcement = Some("Tag created".to_owned());
+            }
+            Ok(Update::CommentChanged(asset, retry, result)) => {
+                let message = match &result {
+                    Ok(CommentChange::Deleted(_)) => "Comment deleted",
+                    Ok(CommentChange::Upsert(_)) if retry.is_some() => "Comment moved",
+                    Ok(CommentChange::Upsert(_)) => "Comment saved",
+                    Err(_) => {
+                        self.closing = false;
+                        "Could not apply comment change"
+                    }
+                };
+                self.announcement = Some(Word::plain(message).english.to_owned());
+                self.viewer.comment_changed(asset, retry, result);
             }
             Ok(Update::NoteSaved(path, id, text, result)) => {
                 let key = (path, id);
@@ -1043,6 +1101,14 @@ impl Desktop {
             .enumerate()
             .map(|(at, row)| (row.asset.id, at))
             .collect();
+        if self
+            .viewer
+            .asset()
+            .is_some_and(|id| !self.positions.contains_key(&id))
+        {
+            self.viewer.close();
+            self.restore_grid_focus = true;
+        }
         self.selection
             .items
             .retain(|id| self.positions.contains_key(id));
@@ -1116,67 +1182,61 @@ impl Desktop {
     }
 
     fn navigation(&mut self, ui: &mut Ui) {
-        let pad = panel_padding(ui);
-        Frame::new().inner_margin(Margin::same(pad)).show(ui, |ui| {
-            craft::egui::ScrollArea::vertical()
-                .id_salt("library-navigation-scroll")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    let source = keyed(&DEFAULT_VIEWS, |(view, _, _)| view.clone())
-                        .with_text(|(_, name, _)| Cow::Borrowed(*name));
-                    let selection = if DEFAULT_VIEWS
-                        .iter()
-                        .any(|(view, _, _)| *view == self.browse.view)
-                    {
-                        Selection::single(self.browse.view.clone())
-                    } else {
-                        Selection::default()
-                    };
-                    let out = List::new(Word::plain("Library views"))
-                        .activate(ActivateOn::Click)
-                        .selection(Bind::given(selection))
-                        .sizing(Sizing::FillWidth)
-                        .natural_height(true)
-                        .show_items(ui, &source, &mut |view, _| {
-                            let (_, name, icon) = DEFAULT_VIEWS
-                                .iter()
-                                .find(|(key, _, _)| key == view)
-                                .unwrap();
-                            ListRow::new(Word::plain(name))
-                                .icon(IconSpec::svg(IconId::new(icon)))
-                                .trailing(self.count(view).to_string())
-                        });
-                    for event in out.events {
-                        if let CollectionEvent::Activate(view) = event {
-                            self.navigate_to(view);
-                        }
-                    }
-
-                    ui.add_space(Env::of(ui).tokens.space.gap.section);
-                    ui.horizontal(|ui| {
-                        Text::new(Word::plain("Folders"))
-                            .role(TypeRole::SectionCaption)
-                            .shade(Shade::Muted)
-                            .show(ui);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let parent = self.browse.folder();
-                            let label = if parent.is_some() {
-                                "New subfolder"
-                            } else {
-                                "New folder"
-                            };
-                            if chrome_icon("plus", label)
-                                .enabled(self.idle())
-                                .show(ui)
-                                .clicked()
-                            {
-                                self.start_folder(parent);
-                            }
-                        });
-                    });
-                    self.folder_tree(ui);
-                });
+        let source = keyed(&NAVIGATION_ITEMS, |(view, _, _)| view.clone())
+            .with_text(|(_, name, _)| Cow::Borrowed(*name));
+        let current = Some(self.browse.view.clone());
+        let selection = if NAVIGATION_ITEMS.iter().any(|(view, _, _)| *view == current) {
+            Selection::single(current)
+        } else {
+            Selection::default()
+        };
+        let out = List::new(Word::plain("Library views"))
+            .activate(ActivateOn::Click)
+            .selection(Bind::given(selection))
+            .sizing(Sizing::FillWidth)
+            .natural_height(true)
+            .show_items(ui, &source, &mut |view, row| {
+                let (_, name, icon) = NAVIGATION_ITEMS[row.at];
+                let item = ListRow::new(Word::plain(name)).icon(IconSpec::svg(IconId::new(icon)));
+                if let Some(view) = view {
+                    item.trailing(self.count(view).to_string())
+                } else {
+                    item.trailing(self.organization.tags.len().to_string())
+                        .enabled(self.idle())
+                }
+            });
+        for event in out.events {
+            if let CollectionEvent::Activate(view) = event {
+                if let Some(view) = view {
+                    self.navigate_to(view);
+                } else if self.idle() {
+                    self.open_tag_manager();
+                }
+            }
+        }
+        ui.add_space(Env::of(ui).tokens.space.gap.section);
+        ui.horizontal(|ui| {
+            Text::new(Word::plain("Folders"))
+                .role(TypeRole::SectionCaption)
+                .shade(Shade::Muted)
+                .show(ui);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let parent = self.browse.folder();
+                let label = if parent.is_some() {
+                    "New subfolder"
+                } else {
+                    "New folder"
+                };
+                if chrome_icon("plus", label)
+                    .enabled(self.idle())
+                    .show(ui)
+                    .clicked()
+                {
+                    self.start_folder(parent);
+                }
+            });
         });
+        self.folder_tree(ui);
     }
 
     fn count(&self, view: &AssetView) -> u64 {
@@ -1502,12 +1562,8 @@ impl Desktop {
     }
 
     fn inspector(&mut self, ui: &mut Ui) {
-        let pad = panel_padding(ui);
-        Frame::new().inner_margin(Margin::same(pad)).show(ui, |ui| {
-            craft::egui::ScrollArea::vertical()
-                .id_salt("asset-inspector-scroll")
-                .auto_shrink([false, true])
-                .show(ui, |ui| self.inspector_content(ui));
+        ui.add_enabled_ui(!self.viewer.editing_comment(), |ui| {
+            self.inspector_content(ui)
         });
     }
 
@@ -1527,20 +1583,34 @@ impl Desktop {
         })
     }
 
-    fn inspector_preview(&self, ui: &mut Ui) {
-        let count = self.selection.items.len();
-        let paths = self.preview_paths(&self.selection.items);
-        let label = if count > 1 {
-            "Selected images preview"
+    fn inspector_preview(&self, ui: &mut Ui, assets: &[Uuid]) {
+        let count = assets.len();
+        let paths = self.preview_paths(assets);
+        let label: craft::ui::runtime::env::Label = if count > 1 {
+            let label = Env::of(ui)
+                .view()
+                .resolve(&Word::plain("Selected images preview").into());
+            format!("{} · {count}", label.as_str()).into()
         } else {
-            "Selected image"
+            Word::plain("Selected image").into()
         };
-        let height = Env::of(ui).tokens.size.thumb.lg;
+        let width = ui.available_width();
+        let sizes = &Env::of(ui).tokens.size.thumb;
+        let height = if count == 1 {
+            paths[0]
+                .and_then(|path| self.previews.dimensions(path))
+                .map_or(width, |size| {
+                    width * size.height as f32 / size.width.max(1) as f32
+                })
+                .clamp(sizes.lg.min(width), width)
+        } else {
+            width
+        };
         let (rect, _) = ui.allocate_exact_size(
-            craft::egui::vec2(ui.available_width(), height),
+            craft::egui::vec2(width, height),
             craft::egui::Sense::hover(),
         );
-        Picture::painter(Word::plain(label), ThumbAspect::SQUARE, |cx, rect| {
+        Picture::painter(label, ThumbAspect::SQUARE, |cx, rect| {
             self.previews
                 .paint_selection(cx, rect, paths, count, PreviewSurface::Inspector);
         })
@@ -1567,9 +1637,9 @@ impl Desktop {
             .tokens
             .size
             .thumb
-            .lg
-            .min(window.width())
-            .min(window.height());
+            .card
+            .min(window.width() * 0.45)
+            .min(window.height() * 0.45);
         let offset = env.tokens.space.gap.row;
         let x = if pointer.x + offset + side <= window.right() {
             pointer.x + offset
@@ -1598,29 +1668,33 @@ impl Desktop {
     }
 
     fn inspector_content(&mut self, ui: &mut Ui) {
-        if self.selection.items.len() != 1 {
+        let assets = self
+            .viewer
+            .asset()
+            .map_or_else(|| self.selection.items.clone(), |id| vec![id]);
+        if assets.len() != 1 {
             Text::new(Word::plain("Inspector"))
                 .role(TypeRole::BodyStrong)
                 .show(ui);
-            let text = if self.selection.items.is_empty() {
+            let text = if assets.is_empty() {
                 Word::plain("No selection")
             } else {
                 Word::plain("Multiple assets selected")
             };
             Text::new(text).shade(Shade::Muted).show(ui);
-            if !self.selection.items.is_empty() {
-                self.inspector_preview(ui);
-                self.asset_metadata(ui);
+            if !assets.is_empty() {
+                self.inspector_preview(ui, &assets);
+                self.asset_metadata(ui, &assets);
             }
             return;
         }
-        let selected = self.selection.items[0];
+        let selected = assets[0];
         let Some(&at) = self.positions.get(&selected) else {
             return;
         };
         let row = &self.rows[at];
         if row.available {
-            self.inspector_preview(ui);
+            self.inspector_preview(ui, &assets);
         }
         let gap = Env::of(ui).tokens.space.gap;
         ui.add_space(gap.row);
@@ -1635,7 +1709,7 @@ impl Desktop {
         }
 
         let state = row.state;
-        self.asset_metadata(ui);
+        self.asset_metadata(ui, &assets);
         self.file_properties(ui, &self.rows[at]);
         ui.add_space(gap.section);
         let idle = self.idle();
@@ -1735,8 +1809,7 @@ impl Desktop {
             });
     }
 
-    fn asset_metadata(&mut self, ui: &mut Ui) {
-        let ids = self.selection.items.clone();
+    fn asset_metadata(&mut self, ui: &mut Ui, ids: &[Uuid]) {
         let mut tag_counts = BTreeMap::new();
         let mut folder_counts = HashMap::new();
         let mut ratings = ids.iter().map(|id| {
@@ -1799,7 +1872,7 @@ impl Desktop {
             .clicked()
         {
             self.add_tags_draft = Some(AddTagsDraft {
-                assets: ids.clone(),
+                assets: ids.to_vec(),
                 available: available.cloned().collect(),
                 selected: BTreeSet::new(),
             });
@@ -1898,12 +1971,12 @@ impl Desktop {
             edit = Some(MetadataEdit::Rating(0));
         }
 
-        if let [id] = ids.as_slice() {
+        if let [id] = ids {
             self.favorite_switch(ui, *id);
             self.edit_notes(ui, *id);
         }
         if let Some(edit) = edit {
-            self.edit_metadata(ids, edit);
+            self.edit_metadata(ids.to_vec(), edit);
         }
     }
 
@@ -1989,16 +2062,6 @@ impl Desktop {
         }
     }
 
-    fn manage_tags_button(&mut self, ui: &mut Ui) {
-        if chrome_icon("bookmark", "Manage tags")
-            .enabled(self.idle())
-            .show(ui)
-            .clicked()
-        {
-            self.open_tag_manager();
-        }
-    }
-
     fn open_tag_manager(&mut self) {
         self.status = None;
         self.tag_draft = Some(String::new());
@@ -2024,11 +2087,16 @@ impl Desktop {
                 set_tag_dialog_width(ui);
                 let height = Env::of(ui).tokens.size.control.sm;
                 let gap = ui.spacing().item_spacing.y;
-                craft::egui::ScrollArea::vertical()
+                let visible = draft.available.len().min(8);
+                let list_height = height * visible as f32 + gap * visible.saturating_sub(1) as f32;
+                let (list_rect, _) = ui.allocate_exact_size(
+                    craft::egui::vec2(ui.available_width(), list_height),
+                    craft::egui::Sense::hover(),
+                );
+                Stack::new()
                     .id_salt("add-tags-list")
-                    .max_height(height * 8.0 + gap * 7.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
+                    .scroll(Scroll::vertical())
+                    .show_at(ui, list_rect, |ui, _| {
                         for tag in &draft.available {
                             let previous = draft.selected.contains(tag);
                             let mut selected = previous;
@@ -2147,8 +2215,12 @@ impl Desktop {
         let viewport = ui.ctx().content_rect();
         let left = (viewport.left() + sidebar_width(ui, self.navigation_hidden))
             .clamp(available.left(), available.right());
+        let viewed = self.viewed_position();
         let right = (viewport.right() - sidebar_width(ui, self.inspector_hidden))
             .clamp(left, available.right());
+        let inspector_button_left =
+            right.min((available.right() - Env::of(ui).tokens.size.control.md).max(left));
+        let toolbar_right = (inspector_button_left - ui.spacing().item_spacing.x).max(left);
 
         if !self.navigation_hidden {
             let rect =
@@ -2160,27 +2232,120 @@ impl Desktop {
                     .layout(Layout::right_to_left(Align::Center)),
                 |ui| {
                     self.add_button(ui);
-                    self.manage_tags_button(ui);
                     self.sidebar_button(ui, Sidebar::Navigation);
                 },
             );
         }
         let rect = Rect::from_min_max(
             craft::egui::pos2(left, available.top()),
-            craft::egui::pos2(right, available.bottom()),
+            craft::egui::pos2(toolbar_right, available.bottom()),
         );
-        self.workspace_toolbar(ui, rect);
-        if !self.inspector_hidden {
-            let rect = Rect::from_min_max(craft::egui::pos2(right, available.top()), available.max);
+        if let Some(at) = viewed {
+            let writable = self.can_write_comment();
             ui.scope_builder(
-                UiBuilder::new()
-                    .id_salt("inspector-header")
-                    .max_rect(rect)
-                    .layout(Layout::left_to_right(Align::Center)),
+                UiBuilder::new().id_salt("viewer-toolbar").max_rect(rect),
                 |ui| {
-                    self.sidebar_button(ui, Sidebar::Inspector);
+                    ui.set_clip_rect(ui.clip_rect().intersect(rect));
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if self.navigation_hidden {
+                            self.sidebar_button(ui, Sidebar::Navigation);
+                        }
+                        if let Some(action) = self.viewer.header(
+                            ui,
+                            &self.rows[at].asset.display_name,
+                            at,
+                            self.rows.len(),
+                            writable,
+                        ) {
+                            self.viewer_action(action, ui.ctx());
+                        }
+                    });
                 },
             );
+        } else {
+            self.workspace_toolbar(ui, rect);
+        }
+        let rect = Rect::from_min_max(
+            craft::egui::pos2(inspector_button_left, available.top()),
+            available.max,
+        );
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt("inspector-header")
+                .max_rect(rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| self.sidebar_button(ui, Sidebar::Inspector),
+        );
+    }
+
+    fn viewed_position(&self) -> Option<usize> {
+        self.positions.get(&self.viewer.asset()?).copied()
+    }
+
+    fn can_write_comment(&self) -> bool {
+        self.idle() && self.browse.view != AssetView::Trash && !self.closing
+    }
+
+    fn open_asset(&mut self, at: usize, ctx: &Context) {
+        let Some(library) = &self.library else { return };
+        let row = &self.rows[at];
+        self.viewer.open(&row.asset, library.path.clone());
+        self.announcement = Some(format!(
+            "{} · {} / {}",
+            row.asset.display_name,
+            at + 1,
+            self.rows.len()
+        ));
+        ctx.request_repaint();
+    }
+
+    fn viewer_action(&mut self, action: ViewerAction, ctx: &Context) {
+        let Some(at) = self.viewed_position() else {
+            return;
+        };
+        let next = match action {
+            ViewerAction::ToggleCommentTool => {
+                if self.can_write_comment() {
+                    self.viewer.toggle_comment_tool();
+                }
+                ctx.request_repaint();
+                return;
+            }
+            ViewerAction::EditComment(edit) => {
+                if self.can_write_comment()
+                    && let Some(library) = &self.library
+                {
+                    self.viewer.set_saving_comment();
+                    self.submit(
+                        Operation::EditComment(library.path.clone(), self.rows[at].asset.id, edit),
+                        Word::plain("Updating comment…"),
+                    );
+                }
+                return;
+            }
+            ViewerAction::Back => {
+                self.viewer.close();
+                self.restore_grid_focus = true;
+                self.announcement = Some(Word::plain("Library").english.to_owned());
+                ctx.request_repaint();
+                return;
+            }
+            ViewerAction::Previous => at.checked_sub(1),
+            ViewerAction::Next => (at + 1 < self.rows.len()).then_some(at + 1),
+        };
+        if let Some(next) = next {
+            self.open_asset(next, ctx);
+        }
+    }
+
+    fn viewer_status(&mut self, ui: &mut Ui) {
+        if let Some(at) = self.viewed_position() {
+            let pad = panel_padding(ui);
+            Frame::new()
+                .inner_margin(Margin::symmetric(pad, 0))
+                .show(ui, |ui| {
+                    self.viewer.status(ui, self.rows[at].asset.format.as_str());
+                });
         }
     }
 
@@ -2303,7 +2468,6 @@ impl Desktop {
                 if self.navigation_hidden {
                     self.sidebar_button(ui, Sidebar::Navigation);
                     self.add_button(ui);
-                    self.manage_tags_button(ui);
                 }
                 self.library_menu(ui);
             },
@@ -2344,9 +2508,6 @@ impl Desktop {
                 .layout(Layout::right_to_left(Align::Center)),
             |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(search_room));
-                if self.inspector_hidden {
-                    self.sidebar_button(ui, Sidebar::Inspector);
-                }
                 self.browse_controls(ui);
             },
         );
@@ -2664,7 +2825,16 @@ impl Desktop {
                     .at(at(room.left(), left)),
             )
             .label(Word::plain("Library navigation"))
-            .show(ui, |ui, _| self.navigation(ui));
+            .show(ui, |ui, _| {
+                let area = ui.available_rect_before_wrap();
+                Stack::new()
+                    .id_salt("navigation-scroll")
+                    .pad(Pad::Regular)
+                    .scroll(Scroll::vertical())
+                    .show_at(ui, area, |ui, _| {
+                        ui.add_enabled_ui(!self.viewer.editing_comment(), |ui| self.navigation(ui));
+                    });
+            });
         }
         if !self.inspector_hidden {
             let _ = ShellRegion::chrome(
@@ -2673,15 +2843,40 @@ impl Desktop {
                     .at(at(right, room.right())),
             )
             .label(Word::plain("Asset inspector"))
-            .show(ui, |ui, _| self.inspector(ui));
+            .show(ui, |ui, _| {
+                let area = ui.available_rect_before_wrap();
+                Stack::new()
+                    .id_salt("inspector-scroll")
+                    .pad(Pad::Regular)
+                    .scroll(Scroll::vertical())
+                    .show_at(ui, area, |ui, _| {
+                        self.inspector(ui);
+                    });
+            });
         }
+        let viewed = self.viewed_position();
         ui.scope_builder(
             UiBuilder::new()
-                .id_salt("asset-grid")
+                .id_salt(if viewed.is_some() {
+                    "asset-viewer"
+                } else {
+                    "asset-grid"
+                })
                 .max_rect(at(left, right)),
             |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(at(left, right)));
-                self.body(ui);
+                self.operation_status(ui);
+                if let Some(at) = viewed {
+                    let writable = self.can_write_comment();
+                    if let Some(action) =
+                        self.viewer
+                            .body(ui, &self.rows[at].asset.display_name, writable)
+                    {
+                        self.viewer_action(action, ui.ctx());
+                    }
+                } else {
+                    self.body(ui);
+                }
             },
         );
     }
@@ -2756,7 +2951,7 @@ impl Desktop {
         }
     }
 
-    fn body(&mut self, ui: &mut Ui) {
+    fn operation_status(&self, ui: &mut Ui) {
         if let Some(work) = self.work {
             Text::new(work).show(ui);
         }
@@ -2767,6 +2962,9 @@ impl Desktop {
                 .lines(status.details.iter().cloned())
                 .show(ui);
         }
+    }
+
+    fn body(&mut self, ui: &mut Ui) {
         if self.library.is_none() {
             self.start_screen(ui);
             return;
@@ -2816,6 +3014,7 @@ impl Desktop {
         let zoom = self.zoom_spec();
         let at_maximum = self.zoom >= self.zoom_limit;
         let mut grid = TileGrid::new(Word::plain("Files"))
+            .activate(ActivateOn::DoubleClick)
             .drag_payload(|drag| Some(DraggedAssets(drag.keys.clone())))
             .drag_preview(RowPreview::None)
             .empty(Word::plain(empty))
@@ -2826,6 +3025,11 @@ impl Desktop {
             } else {
                 CaptionPlace::None
             });
+        if !craft::ui::runtime::measure::active(ui.ctx())
+            && std::mem::take(&mut self.restore_grid_focus)
+        {
+            grid = grid.request_focus(FocusRequest::Take);
+        }
         if self.show_details {
             grid = grid.detail_line();
         }
@@ -2835,30 +3039,46 @@ impl Desktop {
             grid.aspect(4.0 / 3.0).fill_row()
         };
         let pad = panel_padding(ui);
-        Frame::new().inner_margin(Margin::same(pad)).show(ui, |ui| {
-            let _ = grid.show_items(ui, &source, &mut |key, _| {
-                let row = &source.rows[source.positions[key]];
-                let path = &row.asset.path;
-                let size = self.previews.dimensions(path);
-                let mut tile = Tile::new(row.asset.display_name.clone());
-                if self.show_details
-                    && let Some(size) = size
-                {
-                    tile = tile.detail(format!("{} × {} px", size.width, size.height));
-                }
-                if !row.available {
-                    return tile.status(TileStatus::Offline(Some(
-                        Word::plain("Original unavailable").into(),
-                    )));
-                }
-                let aspect = size.map_or(ThumbAspect::SQUARE, |size| {
-                    ThumbAspect::new(size.width as u16, size.height as u16)
+        let opened = Frame::new()
+            .inner_margin(Margin::same(pad))
+            .show(ui, |ui| {
+                let shown = grid.show_items(ui, &source, &mut |key, _| {
+                    let row = &source.rows[source.positions[key]];
+                    let path = &row.asset.path;
+                    let size = self.previews.dimensions(path);
+                    let mut tile = Tile::new(row.asset.display_name.clone());
+                    if self.show_details
+                        && let Some(size) = size
+                    {
+                        tile = tile.detail(format!("{} × {} px", size.width, size.height));
+                    }
+                    if !row.available {
+                        return tile.status(TileStatus::Offline(Some(
+                            Word::plain("Original unavailable").into(),
+                        )));
+                    }
+                    let aspect = size.map_or(ThumbAspect::SQUARE, |size| {
+                        ThumbAspect::new(size.width as u16, size.height as u16)
+                    });
+                    tile.thumb(aspect, |cx, rect| {
+                        self.previews.paint(cx, rect, path, PreviewSurface::Grid)
+                    })
                 });
-                tile.thumb(aspect, |cx, rect| {
-                    self.previews.paint(cx, rect, path, PreviewSurface::Grid)
-                })
-            });
-        });
+                shown
+                    .response
+                    .events
+                    .into_iter()
+                    .find_map(|event| match event {
+                        CollectionEvent::Activate(id) => Some(id),
+                        _ => None,
+                    })
+            })
+            .inner;
+        if let Some(at) = opened.and_then(|id| self.positions.get(&id).copied())
+            && self.idle()
+        {
+            self.open_asset(at, ui.ctx());
+        }
     }
 }
 
@@ -2987,6 +3207,9 @@ impl ShellApp for Desktop {
 
     fn logic(&mut self, _ctx: &Context) {
         self.receive_work();
+        if let Some(message) = self.viewer.receive() {
+            self.announcement = Some(message.english.to_owned());
+        }
     }
 
     fn tick(&mut self, now: Instant) -> Option<Instant> {
@@ -3005,6 +3228,10 @@ impl ShellApp for Desktop {
     }
 
     fn close_requested(&mut self) -> CloseDecision {
+        if self.viewer.saving_comment() {
+            self.closing = true;
+            return CloseDecision::Hold;
+        }
         if self.pending_notes.is_empty() {
             CloseDecision::Close
         } else {
@@ -3014,6 +3241,7 @@ impl ShellApp for Desktop {
     }
 
     fn ui(&mut self, ui: &mut Ui) {
+        let viewing = self.viewed_position().is_some();
         let opened = self.library.is_some();
         let width = ui.ctx().content_rect().width()
             - sidebar_width(ui, self.navigation_hidden)
@@ -3037,11 +3265,17 @@ impl ShellApp for Desktop {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
             }
         });
-        if opened {
+        if viewing {
+            shell = shell.status(true, |ui, _, app| app.viewer_status(ui));
+        } else if opened {
             shell = shell.status(true, |ui, _, app| app.status_strip(ui));
         }
         shell
-            .body_label(Word::plain("Library"))
+            .body_label(Word::plain(if viewing {
+                "Asset viewer"
+            } else {
+                "Library"
+            }))
             .body(|ui, _, app| {
                 DropVeil::new(Word::plain("Drop files to import")).show_with_files(
                     ui,
@@ -3052,6 +3286,7 @@ impl ShellApp for Desktop {
                         if opened {
                             app.workspace(ui);
                         } else {
+                            app.operation_status(ui);
                             app.body(ui);
                         }
                     },
@@ -3060,10 +3295,11 @@ impl ShellApp for Desktop {
             .show(ui, self);
         self.create_library_dialog(ui);
         self.folder_delete_dialog(ui);
+        let tag_manager_open = self.tag_draft.is_some();
         self.manage_tags_dialog(ui);
         self.add_tags_dialog(ui);
         self.unsaved_notes_dialog(ui);
-        if self.closing && self.pending_notes.is_empty() {
+        if self.closing && self.pending_notes.is_empty() && !self.viewer.saving_comment() {
             ui.ctx().send_viewport_cmd(ViewportCommand::Close);
         } else if self.closing && self.idle() {
             ui.ctx().request_repaint();
@@ -3073,6 +3309,12 @@ impl ShellApp for Desktop {
         self.paint_drag_preview(ui);
         self.receive_pick(ui.ctx());
         self.dialogs.run(ui);
+        if !tag_manager_open
+            && !self.close_note_dialog
+            && let Some(action) = self.viewer.keyboard(ui)
+        {
+            self.viewer_action(action, ui.ctx());
+        }
         if let Some(message) = self.announcement.take() {
             announce(ui.ctx(), message, Politeness::Polite);
         }
