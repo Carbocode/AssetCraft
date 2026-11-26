@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod desktop_audio;
 mod desktop_comments;
+mod desktop_documents;
+mod desktop_extra;
+mod desktop_models;
 mod desktop_recents;
+mod desktop_textures;
 mod desktop_thumbnails;
+mod desktop_video;
 mod desktop_viewer;
 
 use assetcraft::{
@@ -103,9 +109,30 @@ enum AssetEdit {
     Trash(bool),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileFilter {
+    Video,
+    Audio,
+    Model,
+    Cad,
+    Exact(Format),
+}
+
+impl FileFilter {
+    fn matches(self, format: Format) -> bool {
+        match self {
+            Self::Video => format.is_video(),
+            Self::Audio => format.is_audio(),
+            Self::Model => format.is_model(),
+            Self::Cad => format.is_cad(),
+            Self::Exact(expected) => expected == format,
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 struct Filters {
-    format: Option<Format>,
+    format: Option<FileFilter>,
     available: Option<bool>,
     tag: Option<String>,
 }
@@ -563,7 +590,7 @@ async fn lookup(catalog: &mut Catalog, browse: &Browse) -> Result<Vec<Row>, Erro
             browse
                 .filters
                 .format
-                .is_none_or(|format| format == asset.format)
+                .is_none_or(|filter| filter.matches(asset.format))
         })
         .map(|(asset, state)| {
             let file = std::fs::metadata(&asset.path)
@@ -610,20 +637,28 @@ async fn lookup(catalog: &mut Catalog, browse: &Browse) -> Result<Vec<Row>, Erro
 }
 
 fn filter_menu(ui: &mut Ui, filters: &mut Filters, tags: &BTreeMap<String, u64>) {
-    MenuItem::heading(Word::plain("File type")).show(ui);
-    for (format, text) in [
-        (None, "All formats"),
-        (Some(Format::Png), "PNG"),
-        (Some(Format::Jpeg), "JPEG"),
-    ] {
-        if MenuItem::new(Word::plain(text))
-            .check(filters.format == format)
-            .show(ui)
-            .ran
-        {
-            filters.format = format;
+    Menu::submenu_row(ui, Word::plain("File type"), |ui, _| {
+        let groups = [
+            (None, "All formats"),
+            (Some(FileFilter::Video), "Video"),
+            (Some(FileFilter::Audio), "Audio"),
+            (Some(FileFilter::Model), "3D"),
+            (Some(FileFilter::Cad), "CAD"),
+        ];
+        let formats = Format::ALL
+            .iter()
+            .copied()
+            .map(|format| (Some(FileFilter::Exact(format)), format.name()));
+        for (filter, label) in groups.into_iter().chain(formats) {
+            if MenuItem::new(Word::plain(label))
+                .check(filters.format == filter)
+                .show(ui)
+                .ran
+            {
+                filters.format = filter;
+            }
         }
-    }
+    });
     Divider::horizontal().show(ui);
     MenuItem::heading(Word::plain("Original file")).show(ui);
     for (available, text) in [
@@ -1742,16 +1777,14 @@ impl Desktop {
     fn file_properties(&self, ui: &mut Ui, row: &Row) {
         const NAME: ColumnKey = ColumnKey::new("property-name");
         const VALUE: ColumnKey = ColumnKey::new("property-value");
-        let format = match row.asset.format {
-            Format::Png => "PNG",
-            Format::Jpeg => "JPEG",
-        };
+        let format = row.asset.format.name();
         let mut properties = vec![("Format", format.to_owned())];
         if row.available
             && let Some(size) = self.previews.dimensions(&row.asset.path)
         {
             properties.push(("Dimensions", format!("{} × {} px", size.width, size.height)));
         }
+        properties.extend(self.previews.properties(&row.asset.path));
         if let Some(file) = &row.file {
             let size = if file.bytes < 1024 {
                 format!("{} B", file.bytes)
@@ -2344,7 +2377,7 @@ impl Desktop {
             Frame::new()
                 .inner_margin(Margin::symmetric(pad, 0))
                 .show(ui, |ui| {
-                    self.viewer.status(ui, self.rows[at].asset.format.as_str());
+                    self.viewer.status(ui, self.rows[at].asset.format);
                 });
         }
     }
@@ -3322,6 +3355,10 @@ impl ShellApp for Desktop {
 }
 
 fn main() -> eframe::Result {
+    if let Some(code) = craft::dwg::serve_if_asked() {
+        std::process::exit(code);
+    }
+    craft::dwg::use_own_worker();
     let backend = Backend::from_env();
     let mut frame = decide_for(Prefix::new("ASSETCRAFT"), backend, TitleBarPref::Integrated);
     if matches!(frame.frame, WindowFrame::Native) {

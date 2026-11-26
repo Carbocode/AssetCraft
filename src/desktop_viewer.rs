@@ -1,8 +1,8 @@
 use crate::{
     desktop_comments::{CommentChange, CommentEdit, PointComments},
-    desktop_thumbnails::decode_original,
+    desktop_thumbnails::decode_preview,
 };
-use assetcraft::{Asset, Catalog, Error, PointComment};
+use assetcraft::{Asset, Catalog, Error, Format, PointComment};
 use craft::behavior::{
     CancelReason, CanvasView, Cursor, CursorIcon, IconId, PixelSize, ZoomScheme,
     canvas::zoom,
@@ -13,6 +13,7 @@ use craft::egui::{Align, Color32, ColorImage, Id, Layout, Rect, Ui, UiBuilder};
 use craft::host::queue::{JobQueue, Priority, QueueOptions};
 use craft::host::{Host, Wake};
 use craft::i18n::Word;
+use craft::image_codecs::Image;
 use craft::theme::variant::{Tone, Variant};
 use craft::theme::{ControlSize, TypeRole};
 use craft::ui::buttons::Button;
@@ -35,6 +36,7 @@ use craft::ui::runtime::overlay::{OpenFilter, any_open};
 use craft::ui::value_drag::{Slider, SliderScale};
 use futures_executor::block_on;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub enum ViewerAction {
@@ -103,18 +105,66 @@ impl CanvasTool for ViewerPan {
     }
 }
 
-struct DetailImage {
+struct DetailFrame {
     pixels: ColorImage,
-    revision: Revision,
+    duration: Duration,
+}
+
+impl DetailFrame {
+    fn new(image: Image, delay_ms: u32) -> Self {
+        let (width, height) = image.dimensions();
+        Self {
+            pixels: ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &image.to_rgba8(),
+            ),
+            duration: Duration::from_millis(u64::from(delay_ms.max(20))),
+        }
+    }
+}
+
+struct DetailImage {
+    frames: Vec<DetailFrame>,
+    index: usize,
+    next_frame: Option<Instant>,
+    generation: u64,
+    animation_error: Option<String>,
+}
+
+impl DetailImage {
+    fn current(&self) -> &DetailFrame {
+        &self.frames[self.index]
+    }
+
+    fn toggle_playback(&mut self) {
+        self.next_frame = match self.next_frame {
+            Some(_) => None,
+            None => Some(Instant::now() + self.current().duration),
+        };
+    }
+
+    fn advance(&mut self, ui: &Ui) {
+        if let Some(mut deadline) = self.next_frame {
+            let now = Instant::now();
+            if now >= deadline {
+                self.index = (self.index + 1) % self.frames.len();
+                deadline = now + self.current().duration;
+                self.next_frame = Some(deadline);
+            }
+            ui.ctx()
+                .request_repaint_after(deadline.saturating_duration_since(now));
+        }
+    }
 }
 
 impl RasterSource for DetailImage {
     fn size(&self) -> PixelSize {
-        PixelSize::new(self.pixels.size[0] as u32, self.pixels.size[1] as u32)
+        let [width, height] = self.current().pixels.size;
+        PixelSize::new(width as u32, height as u32)
     }
 
     fn revision(&self) -> Revision {
-        self.revision
+        Revision::of(&(self.generation, self.index))
     }
 
     fn damage(&self, _since: Revision) -> Option<PixelRect> {
@@ -122,7 +172,8 @@ impl RasterSource for DetailImage {
     }
 
     fn read(&self, region: PixelRect, factor: u32, out: &mut ColorImage) {
-        let [width, height] = self.pixels.size;
+        let pixels = &self.current().pixels;
+        let [width, height] = pixels.size;
         let factor = i64::from(factor);
         let stride = out.size[0];
         if stride == 0 {
@@ -134,7 +185,7 @@ impl RasterSource for DetailImage {
                 row.fill(Color32::TRANSPARENT);
                 continue;
             }
-            let source = &self.pixels.pixels[y as usize * width..][..width];
+            let source = &pixels.pixels[y as usize * width..][..width];
             for (x, pixel) in row.iter_mut().enumerate() {
                 let x = i64::from(region.x0) + x as i64 * factor;
                 *pixel = if (0..width as i64).contains(&x) && x < i64::from(region.x1) {
@@ -228,19 +279,33 @@ impl Viewer {
         let path = asset.path.clone();
         self.queue
             .submit(generation, Priority::VISIBLE, move |cancel| {
-                let original = decode_original(&path, cancel)?;
-                let (width, height) = original.dimensions();
-                let rgba = original.to_rgba8();
-                drop(original);
+                let preview = decode_preview(&path, cancel)?;
+                let (animation, animation_error) = match preview.animation {
+                    Ok(frames) => (frames, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                let frames = if animation.len() > 1 {
+                    drop(preview.image);
+                    let mut frames = Vec::with_capacity(animation.len());
+                    for frame in animation {
+                        if cancel.is_cancelled() {
+                            return Err(ThumbError::Cancelled);
+                        }
+                        frames.push(DetailFrame::new(frame.image, frame.delay_ms));
+                    }
+                    frames
+                } else {
+                    vec![DetailFrame::new(preview.image, 0)]
+                };
                 if cancel.is_cancelled() {
                     return Err(ThumbError::Cancelled);
                 }
                 Ok(DetailImage {
-                    pixels: ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    ),
-                    revision: Revision::new(generation),
+                    frames,
+                    index: 0,
+                    next_frame: None,
+                    generation,
+                    animation_error,
                 })
             });
     }
@@ -319,7 +384,9 @@ impl Viewer {
                 ),
                 Err(ThumbError::Unsupported) => (
                     ImageState::Unsupported,
-                    Some(Word::plain("Preview supports PNG and JPEG images")),
+                    Some(Word::plain(
+                        "Preview unavailable for this format or variant",
+                    )),
                 ),
                 Err(ThumbError::Cancelled) => continue,
                 Err(error) => (
@@ -327,7 +394,7 @@ impl Viewer {
                         ThumbError::Failed(detail) => detail,
                         _ => format!("{error:?}"),
                     }),
-                    Some(Word::plain("Could not open image")),
+                    Some(Word::plain("Could not open preview")),
                 ),
             };
             if matches!(open.state, ImageState::Ready(_)) {
@@ -414,6 +481,25 @@ impl Viewer {
         let open = self.open.as_mut()?;
         let browsing = !open.comments.editing() && !open.comments.saving;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let ImageState::Ready(image) = &mut open.state
+                && image.frames.len() > 1
+            {
+                let label = if image.next_frame.is_some() {
+                    "Pause animation"
+                } else {
+                    "Play animation"
+                };
+                let playback = Button::new(Word::plain(label))
+                    .id(ui.make_persistent_id("animation-playback"))
+                    .variant(Variant::GHOST)
+                    .enabled(browsing)
+                    .show(ui);
+                if playback.clicked() {
+                    playback.response.request_focus();
+                    image.toggle_playback();
+                    ui.ctx().request_repaint();
+                }
+            }
             let tool_label = if open.comments.placing {
                 "Stop adding comments"
             } else {
@@ -484,6 +570,16 @@ impl Viewer {
         } else if matches!(open.state, ImageState::Ready(_)) && !open.comments.available() {
             Text::new(Word::plain("Loading comments…")).show(ui);
         }
+        if let ImageState::Ready(image) = &mut open.state {
+            if !craft::ui::runtime::measure::active(ui.ctx()) {
+                image.advance(ui);
+            }
+            if let Some(error) = &image.animation_error {
+                Notice::new(Tone::Bad, Word::plain("Could not play animation"))
+                    .lines([error.clone()])
+                    .show(ui);
+            }
+        }
         Self::image(open, ui, name, writable)
     }
 
@@ -497,13 +593,14 @@ impl Viewer {
             ImageState::Ready(image) => image,
             state => {
                 let (label, detail) = match state {
-                    ImageState::Loading => (Word::plain("Loading image…"), None),
+                    ImageState::Loading => (Word::plain("Loading preview…"), None),
                     ImageState::Unavailable => (Word::plain("Original unavailable"), None),
-                    ImageState::Unsupported => {
-                        (Word::plain("Preview supports PNG and JPEG images"), None)
-                    }
+                    ImageState::Unsupported => (
+                        Word::plain("Preview unavailable for this format or variant"),
+                        None,
+                    ),
                     ImageState::Failed(error) => {
-                        (Word::plain("Could not open image"), Some(error.as_str()))
+                        (Word::plain("Could not open preview"), Some(error.as_str()))
                     }
                     ImageState::Ready(_) => return None,
                 };
@@ -583,7 +680,7 @@ impl Viewer {
         action
     }
 
-    pub fn status(&mut self, ui: &mut Ui, format: &str) {
+    pub fn status(&mut self, ui: &mut Ui, format: Format) {
         let Some(open) = &mut self.open else { return };
         let size = match &open.state {
             ImageState::Ready(image) => Some(image.size()),
@@ -594,9 +691,10 @@ impl Viewer {
                 ControlRow::new().show(ui, |ui, _| open.zoom_controls(ui, size));
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let metadata = size.map_or_else(
-                    || format.to_owned(),
-                    |size| format!("{format} · {} × {} px", size.width, size.height),
+                let label = format.name();
+                let metadata = size.filter(|_| format.codec().is_some()).map_or_else(
+                    || label.to_owned(),
+                    |size| format!("{label} · {} × {} px", size.width, size.height),
                 );
                 Text::new(metadata)
                     .role(TypeRole::Caption)

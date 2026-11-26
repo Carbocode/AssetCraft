@@ -19,7 +19,8 @@ const JPEG: &[u8] = &[
     0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x0a, 0xff, 0xd9,
 ];
 
-use assetcraft::Catalog;
+use assetcraft::{AssetView, Catalog, Format};
+use craft::image_codecs::{self, ChannelLayout, EncodeOptions, Image};
 use futures_executor::block_on;
 use sha2::{Digest, Sha256};
 use sqlx::Connection;
@@ -36,7 +37,132 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_audio.rs"]
+mod desktop_audio;
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_documents.rs"]
+mod desktop_documents;
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_extra.rs"]
+mod desktop_extra;
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_textures.rs"]
+mod desktop_textures;
+
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_models.rs"]
+mod desktop_models;
+
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_video.rs"]
+mod desktop_video;
+
 const CATALOG: &str = "catalog.sqlite";
+
+#[cfg(feature = "desktop")]
+#[test]
+fn extended_assets_keep_previews_after_migrating_a_version_twelve_catalog() {
+    use craft::host::queue::Cancel;
+
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("existing.png", PNG);
+    fixture.ok(&["add", CATALOG, "existing.png"]);
+    block_on(fixture.execute_sql("PRAGMA user_version = 12"));
+    let palette = b"GIMP Palette\nName: Earth\n25 76 125 Ocean\n83 121 51 Land\n";
+    let source = b"#usda 1.0\n( upAxis = \"Y\" )\ndef Mesh \"Panel\" {\n point3f[] points = [(0, 0, 0), (2, 0, 0), (0, 2, 0)]\n int[] faceVertexCounts = [3]\n int[] faceVertexIndices = [0, 1, 2]\n}\n";
+    let animation = br#"{"v":"5.7.0","w":96,"h":64,"fr":24,"ip":0,"op":48,"layers":[]}"#;
+    let mut ktx = b"\xabKTX 11\xbb\r\n\x1a\n".to_vec();
+    for word in [
+        0x04030201u32,
+        0x1401,
+        1,
+        0x1907,
+        0x8051,
+        0x1907,
+        2,
+        1,
+        0,
+        0,
+        1,
+        1,
+        0,
+        8,
+    ] {
+        ktx.extend(word.to_le_bytes());
+    }
+    ktx.extend([240, 20, 18, 22, 230, 15, 0, 0]);
+    let mut wav = Vec::new();
+    let samples: Vec<_> = (0..8000)
+        .flat_map(|index| (if index % 8 < 4 { 16000i16 } else { -16000i16 }).to_le_bytes())
+        .collect();
+    wav.extend(b"RIFF");
+    wav.extend((samples.len() as u32 + 36).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    for field in [16u32, 0x0001_0001, 8000, 16000, 0x0010_0002] {
+        wav.extend(field.to_le_bytes());
+    }
+    wav.extend(b"data");
+    wav.extend((samples.len() as u32).to_le_bytes());
+    wav.extend(samples);
+    for (name, format, content) in [
+        ("palette.data", Format::Gpl, palette.as_slice()),
+        ("model.usda", Format::Usd, source),
+        ("clip.json", Format::Lottie, animation),
+        ("texture.ktx", Format::Ktx, &ktx),
+        ("recording.wav", Format::Wav, &wav),
+    ] {
+        fixture.write(name, content);
+        fixture.ok(&["add", CATALOG, name]);
+        assert!(
+            fixture
+                .ok(&["find", CATALOG, name])
+                .contains(&format!("\t{}\tavailable\t", format.as_str()))
+        );
+    }
+    let cancel = Cancel::new();
+    let palette = desktop_extra::render(Format::Gpl, palette, Default::default(), 96, &cancel);
+    assert_eq!(&palette.image.unwrap().to_rgba8()[..4], &[25, 76, 125, 255]);
+    let usd = desktop_models::render(
+        &fixture.0.join("model.usda"),
+        Format::Usd,
+        source,
+        96,
+        &cancel,
+    );
+    assert!(usd.image.is_ok(), "{:?}", usd.properties);
+    let animation =
+        desktop_extra::render(Format::Lottie, animation, Default::default(), 96, &cancel);
+    assert!(
+        animation
+            .properties
+            .contains(&("Duration", "2.000 s".into()))
+    );
+    let texture = desktop_textures::render(&ktx, Format::Ktx).unwrap();
+    assert_eq!(
+        texture.image.unwrap().to_rgba8(),
+        [240, 20, 18, 255, 22, 230, 15, 255]
+    );
+    let wav = desktop_audio::render(
+        fs::File::open(fixture.0.join("recording.wav")).unwrap(),
+        Format::Wav,
+        96,
+        &cancel,
+    );
+    assert!(wav.properties.contains(&("Duration", "1.000 s".into())));
+    let waveform = wav.image.unwrap().to_rgba8();
+    assert!(
+        waveform
+            .chunks_exact(4)
+            .any(|pixel| pixel != &waveform[..4])
+    );
+    assert!(
+        fixture
+            .ok(&["find", CATALOG, "existing.png"])
+            .contains("\tpng\tavailable\t")
+    );
+}
 
 struct Fixture(PathBuf);
 
@@ -142,6 +268,413 @@ fn library_and_referenced_images_survive_separate_cli_invocations() {
 }
 
 #[test]
+fn new_raster_formats_are_recognized_persisted_and_reopen_after_import() {
+    let fixture = Fixture::new();
+    fixture.create();
+    let image = Image::from_u8(16, 8, ChannelLayout::Rgb, [30, 150, 220].repeat(16 * 8)).unwrap();
+    let formats = [
+        (Format::WebP, "webp.png"),
+        (Format::Tiff, "tiff.data"),
+        (Format::Bmp, "bmp.data"),
+        (Format::Gif, "gif.data"),
+        (Format::Ico, "ico.data"),
+        (Format::Tga, "tga.TGA"),
+        (Format::Qoi, "qoi.data"),
+        (Format::Dds, "dds.data"),
+        (Format::Pnm, "netpbm.data"),
+        (Format::Sgi, "sgi.data"),
+        (Format::SunRaster, "sun-raster.data"),
+        (Format::Jxl, "jpeg-xl.data"),
+    ];
+    let mut arguments = vec!["add", CATALOG];
+    for (format, name) in formats {
+        let bytes =
+            image_codecs::encode(&image, format.codec().unwrap(), &EncodeOptions::default())
+                .unwrap();
+        fixture.write(name, &bytes);
+        arguments.push(name);
+    }
+    fixture.ok(&arguments);
+    block_on(async {
+        let mut catalog = Catalog::open(&fixture.0.join(CATALOG)).await.unwrap();
+        let assets = catalog.find("").await.unwrap();
+        assert_eq!(assets.len(), formats.len());
+        for (format, name) in formats {
+            let entry = assets
+                .iter()
+                .find(|asset| asset.display_name == name)
+                .unwrap();
+            assert_eq!(entry.format, format);
+            let bytes = fs::read(&entry.path).unwrap();
+            assert_eq!(
+                entry.sha256_at_import,
+                <[u8; 32]>::from(Sha256::digest(&bytes))
+            );
+            #[cfg(feature = "desktop")]
+            assert_eq!(
+                image_codecs::decode_as(format.codec().unwrap(), &bytes)
+                    .unwrap()
+                    .dimensions(),
+                image.dimensions()
+            );
+        }
+        catalog.close().await.unwrap();
+    });
+}
+
+#[test]
+fn document_assets_reopen_with_their_detected_formats_and_original_hashes() {
+    use craft::zip::{Compression, Writer};
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("previous.png", PNG);
+    fixture.ok(&["add", CATALOG, "previous.png"]);
+    // Version 9 uses the same table and allowed only raster formats in the application.
+    block_on(fixture.execute_sql("PRAGMA user_version = 9"));
+    let mut ora = Writer::new();
+    ora.add("mimetype", b"image/openraster", Compression::Stored)
+        .unwrap();
+    ora.add("mergedimage.png", PNG, Compression::Stored)
+        .unwrap();
+    let ora = ora.finish().unwrap();
+    let mut photo = Writer::new();
+    photo
+        .add(
+            "manifest.json",
+            br#"{"format_version":1,"document":{}}"#,
+            Compression::Deflated,
+        )
+        .unwrap();
+    // Leave the central directory outside the import prefix to exercise seekable detection.
+    photo.add("thumb.png", PNG, Compression::Stored).unwrap();
+    photo
+        .add("blobs/test.zst", &[17; 8192], Compression::Stored)
+        .unwrap();
+    let photo = photo.finish().unwrap();
+    let entries: &[(&str, Format, &[u8])] = &[
+        ("vector.png", Format::Svg, br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10"/></svg>"#),
+        ("page.dat", Format::Pdf, b"%PDF-1.7\n%%EOF\n"),
+        ("print.dat", Format::Eps, b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 2 1\n%%BeginPreview: 2 1 1 1\n% 80\n%%EndPreview\n%%EOF\n"),
+        ("camera.cr2", Format::Raw, b"II*\0\x10\0\0\0CR\x02\0\0\0\0\0"),
+        ("art.ora", Format::Ora, &ora),
+        ("art.pcraft", Format::Pcraft, &photo),
+        ("art.drawcraft", Format::VectorCraft, br#"{"format":"drawcraft","version":2}"#),
+    ];
+    let mut args = vec!["add", CATALOG];
+    for &(name, _, bytes) in entries {
+        fixture.write(name, bytes);
+        args.push(name);
+    }
+    fixture.ok(&args);
+    block_on(async {
+        let mut catalog = Catalog::open(&fixture.0.join(CATALOG)).await.unwrap();
+        let assets = catalog.find("").await.unwrap();
+        assert_eq!(assets.len(), entries.len() + 1);
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.display_name == "previous.png" && asset.format == Format::Png)
+        );
+        for &(name, format, bytes) in entries {
+            let entry = assets
+                .iter()
+                .find(|asset| asset.display_name == name)
+                .unwrap();
+            assert_eq!(entry.format, format);
+            assert_eq!(
+                entry.sha256_at_import,
+                <[u8; 32]>::from(Sha256::digest(bytes))
+            );
+        }
+        catalog.close().await.unwrap();
+    });
+    fixture.write("renamed.pcraft", b"This is not a bundle");
+    assert!(
+        !fixture
+            .run(["add", CATALOG, "renamed.pcraft"])
+            .status
+            .success()
+    );
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn vector_previews_render_the_document_size_and_first_pdf_page() {
+    use craft::browse::thumbs::ThumbError;
+    use craft::host::queue::Cancel;
+    use std::io::Write;
+
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="192" height="128"><rect width="192" height="128" fill="red"/></svg>"#;
+    let vector = desktop_documents::render(
+        Format::Svg,
+        svg.to_vec(),
+        Default::default(),
+        desktop_documents::VIEWER_EDGE,
+        &Cancel::new(),
+    );
+    assert!(
+        vector
+            .properties
+            .iter()
+            .any(|(label, value)| *label == "Document size" && value.contains("192"))
+    );
+    let vector = vector.image.unwrap();
+    let (width, height) = vector.dimensions();
+    assert_eq!(width * 2, height * 3);
+    assert!(
+        vector
+            .to_rgba8()
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 0, 0, 255])
+    );
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_owned(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 192 128] /Resources << >> /Contents 5 0 R >>"
+            .to_owned(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 128 192] /Resources << >> >>".to_owned(),
+        "<< /Length 25 >>\nstream\n1 0 0 rg 0 0 192 128 re f\nendstream".to_owned(),
+    ];
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        writeln!(pdf, "{} 0 obj\n{}\nendobj", index + 1, object).unwrap();
+    }
+    let xref = pdf.len();
+    writeln!(pdf, "xref\n0 6\n0000000000 65535 f ").unwrap();
+    for offset in offsets {
+        writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    writeln!(
+        pdf,
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+    )
+    .unwrap();
+    let page = desktop_documents::render(
+        Format::Pdf,
+        pdf,
+        Default::default(),
+        desktop_documents::VIEWER_EDGE,
+        &Cancel::new(),
+    );
+    assert!(
+        page.properties
+            .iter()
+            .any(|(label, value)| *label == "Pages" && value == "2")
+    );
+    let page = page.image.unwrap();
+    let (width, height) = page.dimensions();
+    assert!(width > height);
+    let center = (width as usize * (height / 2) as usize + (width / 2) as usize) * 4;
+    assert_eq!(&page.to_rgba8()[center..center + 4], &[255, 0, 0, 255]);
+
+    let eps = desktop_documents::render(
+        Format::Eps,
+        b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 200 100\n".to_vec(),
+        Default::default(),
+        desktop_documents::VIEWER_EDGE,
+        &Cancel::new(),
+    );
+    assert!(matches!(eps.image, Err(ThumbError::Unsupported)));
+    assert!(
+        eps.properties
+            .iter()
+            .any(|(label, _)| *label == "Bounding box")
+    );
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn video_preview_seeks_past_large_media_and_catalogues_the_container() {
+    use craft::host::queue::Cancel;
+    use craft::media::isobmff::{
+        self, Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions,
+    };
+    use craft::video::prores::{ChromaFormat, Encoder, Frame, Profile};
+    use std::fs::File;
+    use std::io::{Cursor, Seek, SeekFrom, Write};
+
+    let fixture = Fixture::new();
+    fixture.create();
+    block_on(fixture.execute_sql("PRAGMA user_version = 10"));
+    let mut frame = Frame::new(64, 32, ChromaFormat::Yuv422, 10, false).unwrap();
+    frame.y.fill(320);
+    frame.cb.fill(428);
+    frame.cr.fill(820);
+    let packet = Encoder::new(Profile::Standard, 64, 32)
+        .encode(&frame)
+        .unwrap();
+    let mut writer =
+        Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+    let track = writer
+        .add_track(TrackConfig::new(
+            SampleEntry::prores(isobmff::FourCc(*b"apcn"), 64, 32),
+            1000,
+        ))
+        .unwrap();
+    writer
+        .write_sample(
+            track,
+            WriteSample {
+                data: &packet,
+                duration: 1000,
+                composition_offset: 0,
+                is_sync: true,
+            },
+        )
+        .unwrap();
+    let small = writer.finish().unwrap().into_inner();
+    let movie = isobmff::open(small.as_slice()).unwrap();
+    let media_end = movie.moov_offset as usize;
+    let source = fixture.0.join("large-movie.data");
+    let mut file = File::create(&source).unwrap();
+    file.write_all(&small[..media_end]).unwrap();
+    let padding = 72 * 1024 * 1024u32;
+    file.write_all(&padding.to_be_bytes()).unwrap();
+    file.write_all(b"free").unwrap();
+    file.seek(SeekFrom::Current(i64::from(padding) - 8))
+        .unwrap();
+    file.write_all(&small[media_end..]).unwrap();
+    drop(file);
+    assert!(fs::metadata(&source).unwrap().len() > 64 << 20);
+    fixture.ok(&["add", CATALOG, "large-movie.data"]);
+    assert!(
+        fixture
+            .ok(&["find", CATALOG, "large-movie"])
+            .contains("\tmov\tavailable\t")
+    );
+
+    let preview =
+        desktop_video::render(File::open(source).unwrap(), Format::Mov, 32, &Cancel::new());
+    assert!(
+        preview
+            .properties
+            .iter()
+            .any(|(key, value)| *key == "Video codec" && value == "ProRes")
+    );
+    assert!(
+        preview
+            .properties
+            .iter()
+            .any(|(key, value)| *key == "Duration" && value == "0:00:01.000")
+    );
+    let image = preview.image.unwrap();
+    assert_eq!(image.dimensions(), (32, 16));
+    let pixels = image.to_rgba8();
+    assert!(pixels[0] > pixels[1] && pixels[0] > pixels[2]);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn model_and_drawing_previews_survive_a_version_eleven_catalog_upgrade() {
+    use craft::host::queue::Cancel;
+    use craft::mesh::{self, Limits};
+
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("original.png", PNG);
+    fixture.ok(&["add", CATALOG, "original.png"]);
+    block_on(fixture.execute_sql("PRAGMA user_version = 11"));
+
+    let obj = b"v 0 0 0\nv 2 0 0\nv 0 3 0\nf 1 2 3\n";
+    let limits = Limits::default();
+    let scene = mesh::obj::read(obj, &limits, &mut mesh::no_external).unwrap();
+    let glb = mesh::gltf::write_glb(&scene, &limits).unwrap();
+    let stl = mesh::stl::write_binary(&scene, "Original triangle", &limits).unwrap();
+    let ply = b"ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n1 0 0\n0 1 0\n";
+    let dxf = b"0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1032\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nLINE\n100\nAcDbEntity\n8\n0\n100\nAcDbLine\n10\n0\n20\n0\n11\n20\n21\n15\n0\nENDSEC\n0\nEOF\n";
+    craft::dwg::worker::use_worker(
+        PathBuf::from(env!("CARGO_BIN_EXE_assetcraft-desktop")),
+        vec![craft::dwg::WORKER_ARG.into()],
+    );
+    let dwg = craft::dwg::encode_as(dxf, "AC1032").unwrap();
+    for (name, format, contents, property) in [
+        ("wave.obj", Format::Obj, obj.as_slice(), ("Triangles", "1")),
+        ("scene.data", Format::Glb, &glb, ("Triangles", "1")),
+        ("print.stl", Format::Stl, &stl, ("Triangles", "1")),
+        ("points.data", Format::Ply, ply, ("Vertices", "3")),
+        ("plan.data", Format::Dxf, dxf, ("Drawable paths", "1")),
+        ("plan.dwg", Format::Dwg, &dwg, ("DWG version", "AC1032")),
+    ] {
+        fixture.write(name, contents);
+        fixture.ok(&["add", CATALOG, name]);
+        let listed = fixture.ok(&["find", CATALOG, name]);
+        assert!(listed.contains(&format!("\t{}\tavailable\t", format.as_str())));
+        let preview =
+            desktop_models::render(&fixture.0.join(name), format, contents, 112, &Cancel::new());
+        assert!(
+            preview
+                .properties
+                .iter()
+                .any(|(key, value)| (*key, value.as_str()) == property),
+            "{name}: {:?}",
+            preview.properties
+        );
+        let image = preview
+            .image
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        let pixels = image.to_rgba8();
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel != &pixels[..4]),
+            "{name}"
+        );
+    }
+    assert!(
+        fixture
+            .ok(&["find", CATALOG, "original.png"])
+            .contains("\tpng\tavailable\t")
+    );
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn gltf_preview_loads_only_local_geometry_buffers() {
+    use craft::host::queue::Cancel;
+
+    let fixture = Fixture::new();
+    fixture.create();
+    fs::create_dir(fixture.0.join("models")).unwrap();
+    let vertices: Vec<_> = [0.0f32, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    fixture.write("models/geometry.bin", &vertices);
+    fixture.write("outside.bin", &vertices);
+    let gltf = r#"{"asset":{"version":"2.0"},"buffers":[{"uri":"geometry.bin","byteLength":36}],
+        "bufferViews":[{"buffer":0,"byteLength":36}],
+        "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}],
+        "meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],
+        "nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}],"scene":0}"#;
+    let path = "models/local.gltf";
+    fixture.write(path, gltf.as_bytes());
+    fixture.ok(&["add", CATALOG, path]);
+    assert!(
+        fixture
+            .ok(&["find", CATALOG, "local.gltf"])
+            .contains("\tgltf\tavailable\t")
+    );
+    let path = fixture.0.join(path);
+    let render = |text: &str| {
+        desktop_models::render(&path, Format::Gltf, text.as_bytes(), 96, &Cancel::new())
+    };
+    assert!(render(gltf).image.is_ok());
+    let blocked = render(&gltf.replace("geometry.bin", "../outside.bin"));
+    assert!(blocked.image.is_err());
+    assert!(blocked.properties.iter().any(|(key, _)| *key == "Preview"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../outside.bin", fixture.0.join("models/link.bin")).unwrap();
+        assert!(
+            render(&gltf.replace("geometry.bin", "link.bin"))
+                .image
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn duplicate_locations_and_partial_failures_have_distinct_outcomes() {
     let fixture = Fixture::new();
     fixture.create();
@@ -223,11 +756,11 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
 
     fs::rename(fixture.0.join(CATALOG), fixture.0.join("untouched")).unwrap();
     fixture.create();
-    block_on(fixture.execute_sql("PRAGMA user_version = 9"));
+    block_on(fixture.execute_sql("PRAGMA user_version = 14"));
     let expected = fs::read(fixture.0.join(CATALOG)).unwrap();
     let output = fixture.run(["add", CATALOG, "image.png"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("version 9 is unsupported"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version 14 is unsupported"));
     assert_eq!(fs::read(fixture.0.join(CATALOG)).unwrap(), expected);
 
     block_on(fixture.execute_sql("PRAGMA user_version = 5"));
@@ -348,6 +881,119 @@ fn point_comment_edits_keep_text_and_position_independent_and_require_the_owner(
             .status
             .success()
     );
+}
+
+#[test]
+fn migrating_version_eight_preserves_asset_associations_and_delete_cascades() {
+    let fixture = Fixture::new();
+    let baseline = fixture.0.join("version8.sqlite");
+    let original = fixture.0.join("legacy.png");
+    fixture.write("legacy.png", PNG);
+    let asset = Uuid::new_v4();
+    let folder = Uuid::new_v4();
+    block_on(async {
+        let options = SqliteConnectOptions::new()
+            .filename(&baseline)
+            .create_if_missing(true);
+        let mut db = SqliteConnection::connect_with(&options).await.unwrap();
+        for schema in [
+            include_str!("../../src/schema.sql"),
+            include_str!("../../src/schema_7.sql"),
+            include_str!("../../src/schema_8.sql"),
+        ] {
+            sqlx::raw_sql(schema).execute(&mut db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO library VALUES (1, ?, 'Legacy catalog', 0, 'folder', NULL)")
+            .bind(Uuid::new_v4().as_bytes().as_slice())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO asset VALUES (?, ?, 'legacy.png', 'png', ?, 0)")
+            .bind(asset.as_bytes().as_slice())
+            .bind(assetcraft::local_file::encode_path(&original))
+            .bind(Sha256::digest(PNG).as_slice())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO folder (id, name) VALUES (?, 'Textures')")
+            .bind(folder.as_bytes().as_slice())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO folder_asset VALUES (?, ?)")
+            .bind(folder.as_bytes().as_slice())
+            .bind(asset.as_bytes().as_slice())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO library_tag VALUES ('Approved')")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        for query in [
+            "INSERT INTO asset_state VALUES (?, 1, 1)",
+            "INSERT INTO asset_details VALUES (?, 4, 'Keep this')",
+            "INSERT INTO asset_tag VALUES (?, 'Approved')",
+            "INSERT INTO asset_comment VALUES (42, ?, 0.25, 0.75, 'Existing comment')",
+        ] {
+            sqlx::query(query)
+                .bind(asset.as_bytes().as_slice())
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        db.close().await.unwrap();
+    });
+    let baseline_bytes = fs::read(&baseline).unwrap();
+    let upgraded = fixture.0.join(CATALOG);
+    fs::copy(&baseline, &upgraded).unwrap();
+    block_on(async {
+        let mut catalog = Catalog::open(&upgraded).await.unwrap();
+        let organization = catalog.organization().await.unwrap();
+        let details = &organization.assets[&asset];
+        assert_eq!(details.folders, [folder]);
+        assert_eq!(details.tags, ["Approved"]);
+        assert_eq!(details.rating, 4);
+        assert_eq!(details.notes, "Keep this");
+        let trash = catalog
+            .find_filtered(AssetView::Trash, "", None, false)
+            .await
+            .unwrap();
+        assert_eq!(trash[0].0.id, asset);
+        assert!(trash[0].1.favorite);
+        assert_eq!(catalog.point_comments(asset).await.unwrap()[0].id, 42);
+        catalog.close().await.unwrap();
+
+        let mut db = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(upgraded)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+        let version: u32 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(version, 13);
+        sqlx::query("DELETE FROM asset WHERE id = ?")
+            .bind(asset.as_bytes().as_slice())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM folder_asset) + (SELECT count(*) FROM asset_state)
+             + (SELECT count(*) FROM asset_details) + (SELECT count(*) FROM asset_tag)
+             + (SELECT count(*) FROM asset_comment)",
+        )
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
+        db.close().await.unwrap();
+    });
+    assert_eq!(fs::read(baseline).unwrap(), baseline_bytes);
+    assert_eq!(fs::read(original).unwrap(), PNG);
 }
 
 #[test]

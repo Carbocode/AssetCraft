@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A local library for creative references.</strong><br>
-  Browse and organize PNG and JPEG files where they already live.<br>
+  Browse and organize raster images and textures where they already live.<br>
   An independent open-source app built with Rust and the Craft Framework.
 </p>
 
@@ -27,6 +27,13 @@
 ## Features
 
 - **Browse visually.** Switch between grid and justified layouts and inspect thumbnails, dimensions and file properties.
+- **Open images and textures.** Preview PNG, JPEG, WebP, GIF, TIFF, BMP, ICO, TGA, QOI, DDS, AVIF, HEIF, JPEG XL and specialist raster formats. Play GIF and WebP animations in the viewer. Preview coverage depends on the encoding variant.
+- **Preview design assets.** Render SVG and the first page of PDF files, inspect font specimens, and browse camera RAW, EPS, layered artwork and native Craft files using their saved previews where available.
+- **Catalog video.** Browse MP4, QuickTime, WebM, Matroska, AVI, MXF and MPEG transport streams. Inspect codec, dimensions and duration when available. Decode still previews for supported H.264, HEVC, AV1, VP8, VP9, ProRes, DNx, Motion JPEG and MPEG-2 streams.
+- **Inspect audio.** Browse WAV, AIFF, FLAC, MP3, M4A and Ogg/Opus with audio properties and sampled waveforms. Large PCM WAV files are sampled with range reads.
+- **Catalog 3D and CAD.** Preview GLB, glTF, OBJ, STL, PLY, 3MF, FBX, COLLADA, Alembic and USD meshes from a fixed view. Inspect visible model-space linework from DXF and supported DWG files. USD preview covers local static meshes and basic transforms.
+- **Browse layered artwork and creative projects.** Show GIMP palette swatches and an approximate composite of visible XCF layers. Inspect Lottie, dotLottie, Sketch and After Effects metadata and use a saved Sketch preview when present.
+- **Inspect texture and material assets.** Preview supported KTX, KTX2 and Basis Universal encodings, see texture dimensions and mip levels, and inspect MaterialX graphs with a base-color swatch when resolved.
 - **Organize references.** Put an asset in multiple nested folders, assign several tags at once, and add ratings, favorites and notes.
 - **Find what you need.** Search by name or tag and narrow results with filters. Move entries to Trash and restore them from the library.
 - **Keep originals in place.** Import registers references in a local SQLite catalog. Browse or edit catalog metadata without moving the source files.
