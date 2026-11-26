@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Carbocode/assetcraft/actions/workflows/ci.yml"><img src="https://github.com/Carbocode/assetcraft/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="https://github.com/Carbocode/AssetCraft/actions/workflows/ci.yml"><img src="https://github.com/Carbocode/AssetCraft/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-3a3a3a?style=flat-square" alt="Apache-2.0"></a>
   <img src="https://img.shields.io/badge/status-Linux%20preview-236b87?style=flat-square" alt="Linux preview">
 </p>
