@@ -1743,42 +1743,25 @@ impl Desktop {
             .shade(Shade::Muted)
             .show(ui);
         if !tag_counts.is_empty() {
-            let entries: Vec<_> = tag_counts.iter().collect();
-            let source = keyed(&entries, |(tag, _)| (*tag).clone())
-                .with_text(|(tag, _)| Cow::Borrowed(tag.as_str()));
-            let removed = RefCell::new(None);
-            List::new(Word::plain("Assigned tags"))
-                .select(SelectMode::None)
-                .natural_height(true)
-                .size(ControlSize::Sm)
-                .sizing(Sizing::FillWidth)
-                .show_items(ui, &source, &mut |tag, _| {
-                    let label = membership_label(tag, tag_counts[tag], ids.len());
-                    let tag = tag.clone();
-                    let remove = format!("Remove tag: {tag}");
-                    let removed = &removed;
-                    ListRow::new(label.clone())
-                        .icon(IconSpec::svg(IconId::new("bookmark")))
-                        .tooltip(label)
-                        .trailing_field(
-                            chrome_icon("close", "Remove tag")
-                                .label(remove.clone())
-                                .tooltip(remove)
-                                .size(ControlSize::Sm)
-                                .enabled(enabled),
-                            move |output| {
-                                if output.clicked() {
-                                    removed.replace(Some(tag));
-                                }
-                            },
-                        )
-                });
-            if let Some(tag) = removed.into_inner() {
-                edit = Some(MetadataEdit::Tags {
-                    add: Vec::new(),
-                    remove: vec![tag],
-                });
-            }
+            let max_width = ui.available_width();
+            ui.horizontal_wrapped(|ui| {
+                for (tag, count) in &tag_counts {
+                    if membership_chip(
+                        ui,
+                        ("tag", tag),
+                        IconSpec::svg(IconId::new("bookmark")),
+                        membership_label(tag, *count, ids.len()),
+                        format!("Remove tag: {tag}"),
+                        max_width,
+                        enabled,
+                    ) {
+                        edit = Some(MetadataEdit::Tags {
+                            add: Vec::new(),
+                            remove: vec![tag.clone()],
+                        });
+                    }
+                }
+            });
         }
         let available = self
             .organization
@@ -1814,11 +1797,12 @@ impl Desktop {
             ui.horizontal_wrapped(|ui| {
                 for (path, folder) in &folders {
                     if let Some(count) = folder_counts.get(&folder.id)
-                        && folder_chip(
+                        && membership_chip(
                             ui,
-                            folder,
-                            path,
+                            ("folder", folder.id),
+                            appearance_icon(&folder.appearance),
                             membership_label(&folder.name, *count, ids.len()),
+                            format!("Remove from {path}"),
                             max_width,
                             enabled,
                         )
@@ -2795,11 +2779,12 @@ fn format_local_date(date: chrono::DateTime<chrono::Local>) -> String {
     date.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn folder_chip(
+fn membership_chip(
     ui: &mut Ui,
-    folder: &Folder,
-    path: &str,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    icon: IconSpec<'_>,
     label: String,
+    remove: String,
     max_width: f32,
     enabled: bool,
 ) -> bool {
@@ -2834,21 +2819,17 @@ fn folder_chip(
     let (icon_rect, flow) = flow.take_start(icon_side);
     let (_, flow) = flow.take_start(gap);
     let (_, flow) = flow.take_end(gap);
-    Icon::new(appearance_icon(&folder.appearance))
-        .size(ControlSize::Sm)
-        .show_at(
-            ui,
-            Rect::from_center_size(icon_rect.center(), craft::egui::Vec2::splat(icon_side)),
-        );
+    Icon::new(icon).size(ControlSize::Sm).show_at(
+        ui,
+        Rect::from_center_size(icon_rect.center(), craft::egui::Vec2::splat(icon_side)),
+    );
     Text::new(label)
-        .id_salt((folder.id, "label"))
+        .id_salt((&key, "label"))
         .role(TypeRole::Caption)
         .elide(Elide::Middle)
-        .tooltip(path.to_owned())
         .show_at(ui, flow.rect());
-    let remove = format!("Remove from {path}");
-    chrome_icon("close", "Remove from folder")
-        .id_salt((folder.id, "remove"))
+    chrome_icon("close", "Remove")
+        .id_salt((key, "remove"))
         .label(remove.clone())
         .tooltip(remove)
         .size(ControlSize::Sm)
