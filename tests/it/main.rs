@@ -26,7 +26,7 @@ use sqlx::Connection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -182,9 +182,9 @@ fn duplicate_locations_and_partial_failures_have_distinct_outcomes() {
 fn native_paths_round_trip_and_missing_originals_remain_searchable() {
     let fixture = Fixture::new();
     fixture.create();
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let name = OsString::from_vec(b"unusual-\xff.png".to_vec());
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     let name = OsString::from("unusual-素材-📷.png");
     fixture.write(&name, PNG);
     let added = stdout(fixture.run([OsStr::new("add"), OsStr::new(CATALOG), &name]));
