@@ -1,0 +1,618 @@
+use crate::{
+    desktop_comments::{CommentChange, CommentEdit, PointComments},
+    desktop_thumbnails::decode_original,
+};
+use assetcraft::{Asset, Catalog, Error, PointComment};
+use craft::behavior::{
+    CancelReason, CanvasView, Cursor, CursorIcon, IconId, PixelSize, ZoomScheme,
+    canvas::zoom,
+    kurbo::{Point, Size},
+};
+use craft::browse::thumbs::ThumbError;
+use craft::egui::{Align, Color32, ColorImage, Id, Layout, Rect, Ui, UiBuilder};
+use craft::host::queue::{JobQueue, Priority, QueueOptions};
+use craft::host::{Host, Wake};
+use craft::i18n::Word;
+use craft::theme::variant::Variant;
+use craft::theme::{ControlSize, TypeRole};
+use craft::ui::buttons::Button;
+use craft::ui::canvas::{
+    Canvas, CanvasTool, HandTool, NavigationOptions, PixelRect, RasterDisplay, RasterSource,
+    ToolAction, ToolContext, ToolHost, ToolKey, ToolPath, ToolPointer, ViewCommands, ViewTarget,
+    tool_pass,
+};
+use craft::ui::contract::{Bind, Props, Show, ShowContainer};
+use craft::ui::display::{Elide, Shade, Text};
+use craft::ui::layout_components::Row as ControlRow;
+use craft::ui::primitives::textures::Revision;
+use craft::ui::primitives::{Draw, IconSpec};
+use craft::ui::runtime::commands::Binding;
+use craft::ui::runtime::env::{Env, Label};
+use craft::ui::runtime::focus::{self, FocusRequest};
+use craft::ui::runtime::keys::{self, Intent};
+use craft::ui::runtime::overlay::{OpenFilter, any_open};
+use craft::ui::value_drag::{Slider, SliderScale};
+use futures_executor::block_on;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+pub enum ViewerAction {
+    Back,
+    Previous,
+    Next,
+    ToggleCommentTool,
+    EditComment(CommentEdit),
+}
+
+struct ViewerPan {
+    hand: HandTool,
+    dragging: bool,
+}
+
+impl CanvasTool for ViewerPan {
+    fn each_pass(&mut self, cx: &mut ToolContext<'_>) {
+        self.hand.each_pass(cx);
+    }
+
+    fn press(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) -> ToolAction {
+        self.hand.press(pointer, cx)
+    }
+
+    fn drag(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
+        self.dragging = true;
+        self.hand.drag(pointer, cx);
+    }
+
+    fn release(&mut self, pointer: &ToolPointer, cx: &mut ToolContext<'_>) {
+        self.dragging = false;
+        self.hand.release(pointer, cx);
+    }
+
+    fn cancel(&mut self, reason: CancelReason, cx: &mut ToolContext<'_>) {
+        self.dragging = false;
+        self.hand.cancel(reason, cx);
+    }
+
+    fn key(&mut self, key: &ToolKey, cx: &mut ToolContext<'_>) -> bool {
+        self.hand.key(key, cx)
+    }
+
+    fn paint(&self, draw: &Draw<'_>, cx: &ToolContext<'_>) {
+        self.hand.paint(draw, cx);
+    }
+
+    fn view_only(&self) -> bool {
+        self.hand.view_only()
+    }
+
+    fn autoscrolls(&self) -> bool {
+        self.hand.autoscrolls()
+    }
+
+    fn cursor(&self, _: &ToolContext<'_>) -> Cursor {
+        Cursor::System(if self.dragging {
+            CursorIcon::Grabbing
+        } else {
+            CursorIcon::Grab
+        })
+    }
+
+    fn command_form(&self) -> ToolPath {
+        self.hand.command_form()
+    }
+}
+
+struct DetailImage {
+    pixels: ColorImage,
+    revision: Revision,
+}
+
+impl RasterSource for DetailImage {
+    fn size(&self) -> PixelSize {
+        PixelSize::new(self.pixels.size[0] as u32, self.pixels.size[1] as u32)
+    }
+
+    fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    fn damage(&self, _since: Revision) -> Option<PixelRect> {
+        None
+    }
+
+    fn read(&self, region: PixelRect, factor: u32, out: &mut ColorImage) {
+        let [width, height] = self.pixels.size;
+        let factor = i64::from(factor);
+        let stride = out.size[0];
+        if stride == 0 {
+            return;
+        }
+        for (y, row) in out.pixels.chunks_exact_mut(stride).enumerate() {
+            let y = i64::from(region.y0) + y as i64 * factor;
+            if !(0..height as i64).contains(&y) || y >= i64::from(region.y1) {
+                row.fill(Color32::TRANSPARENT);
+                continue;
+            }
+            let source = &self.pixels.pixels[y as usize * width..][..width];
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let x = i64::from(region.x0) + x as i64 * factor;
+                *pixel = if (0..width as i64).contains(&x) && x < i64::from(region.x1) {
+                    source[x as usize]
+                } else {
+                    Color32::TRANSPARENT
+                };
+            }
+        }
+    }
+}
+
+enum ImageState {
+    Loading,
+    Ready(DetailImage),
+    Unavailable,
+    Unsupported,
+    Failed(String),
+}
+
+struct LoadedAsset {
+    image: DetailImage,
+    comments: Result<Vec<PointComment>, Error>,
+}
+
+struct OpenAsset {
+    id: Uuid,
+    state: ImageState,
+    camera: CanvasView,
+    hand: ViewerPan,
+    slider_id: Option<Id>,
+    focus_back: bool,
+    jumped: bool,
+    comments: PointComments,
+}
+
+pub struct Viewer {
+    open: Option<OpenAsset>,
+    generation: u64,
+    queue: JobQueue<u64, Result<LoadedAsset, ThumbError>>,
+}
+
+impl Viewer {
+    pub fn new(host: &Host, wake: Wake) -> Self {
+        Self {
+            open: None,
+            generation: 0,
+            queue: JobQueue::new(
+                host.jobs_shared().clone(),
+                wake,
+                QueueOptions {
+                    lanes: 1,
+                    name: "Load asset viewer",
+                    ..QueueOptions::default()
+                },
+            ),
+        }
+    }
+
+    pub fn asset(&self) -> Option<Uuid> {
+        self.open.as_ref().map(|open| open.id)
+    }
+
+    pub fn open(&mut self, asset: &Asset, catalog_path: PathBuf) {
+        let focus_back = self.open.is_none();
+        self.close();
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.open = Some(OpenAsset {
+            id: asset.id,
+            state: ImageState::Loading,
+            camera: CanvasView::new(Rect::NOTHING, Point::ZERO, 1.0),
+            hand: ViewerPan {
+                hand: HandTool::new(NavigationOptions::default()),
+                dragging: false,
+            },
+            slider_id: None,
+            focus_back,
+            jumped: true,
+            comments: PointComments::default(),
+        });
+        let path = asset.path.clone();
+        let id = asset.id;
+        self.queue
+            .submit(generation, Priority::VISIBLE, move |cancel| {
+                let original = decode_original(&path, cancel)?;
+                let (width, height) = original.dimensions();
+                let rgba = original.to_rgba8();
+                drop(original);
+                if cancel.is_cancelled() {
+                    return Err(ThumbError::Cancelled);
+                }
+                let image = DetailImage {
+                    pixels: ColorImage::from_rgba_unmultiplied(
+                        [width as usize, height as usize],
+                        &rgba,
+                    ),
+                    revision: Revision::new(generation),
+                };
+                let comments = block_on(async {
+                    let mut catalog = Catalog::open(&catalog_path).await?;
+                    let comments = catalog.point_comments(id).await?;
+                    catalog.close().await?;
+                    Ok(comments)
+                });
+                Ok(LoadedAsset { image, comments })
+            });
+    }
+
+    pub fn close(&mut self) {
+        self.open = None;
+        self.queue.reprioritize(|_, _| None);
+    }
+
+    pub fn toggle_comment_tool(&mut self) {
+        if let Some(open) = &mut self.open {
+            open.comments.toggle_tool();
+        }
+    }
+
+    pub fn editing_comment(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.comments.editing())
+    }
+
+    pub fn comment_changed(
+        &mut self,
+        asset: Uuid,
+        retry: Option<i64>,
+        result: Result<CommentChange, Error>,
+    ) {
+        if let Some(open) = self.open.as_mut().filter(|open| open.id == asset) {
+            open.comments.changed(retry, result);
+        }
+    }
+
+    pub fn set_saving_comment(&mut self) {
+        if let Some(open) = &mut self.open {
+            open.comments.saving = true;
+        }
+    }
+
+    pub fn saving_comment(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.comments.saving)
+    }
+
+    pub fn receive(&mut self) -> Option<Word> {
+        let mut announcement = None;
+        while let Some(finished) = self.queue.try_recv() {
+            let Some(open) = self
+                .open
+                .as_mut()
+                .filter(|_| finished.key == self.generation)
+            else {
+                continue;
+            };
+            (open.state, announcement) = match finished.result {
+                Ok(loaded) => {
+                    let label = if loaded.comments.is_ok() {
+                        "Preview ready"
+                    } else {
+                        "Preview ready. Could not load comments"
+                    };
+                    open.comments.loaded(loaded.comments);
+                    (ImageState::Ready(loaded.image), Some(Word::plain(label)))
+                }
+                Err(ThumbError::Missing) => (
+                    ImageState::Unavailable,
+                    Some(Word::plain("Original unavailable")),
+                ),
+                Err(ThumbError::Unsupported) => (
+                    ImageState::Unsupported,
+                    Some(Word::plain("Preview supports PNG and JPEG images")),
+                ),
+                Err(ThumbError::Cancelled) => continue,
+                Err(error) => (
+                    ImageState::Failed(match error {
+                        ThumbError::Failed(detail) => detail,
+                        _ => format!("{error:?}"),
+                    }),
+                    Some(Word::plain("Could not open image")),
+                ),
+            };
+        }
+        announcement
+    }
+
+    pub fn keyboard(&mut self, ui: &Ui) -> Option<ViewerAction> {
+        let open = self.open.as_mut()?;
+        let ctx = ui.ctx();
+        if any_open(ctx, OpenFilter::Keys) {
+            return None;
+        }
+        let rtl = Env::of(ui).direction.is_rtl();
+        if keys::with_window_intents(ctx, rtl, |intents| intents.take(Intent::Cancel)) {
+            if open.comments.saving {
+                return None;
+            }
+            if open.comments.editing() {
+                open.comments.cancel();
+                return None;
+            }
+            if std::mem::take(&mut open.comments.placing) {
+                return None;
+            }
+            return Some(ViewerAction::Back);
+        }
+        let slider_focused = open.slider_id.is_some_and(|id| focus::has(ctx, id));
+        if slider_focused
+            || open.comments.editing()
+            || open.comments.saving
+            || focus::focused_rec(ctx).is_some_and(|focused| focused.stop.text)
+        {
+            return None;
+        }
+        let owner = Id::unique("assetcraft-viewer-navigation");
+        let mut action = None;
+        for (key, direction) in [
+            ("Left", ViewerAction::Previous),
+            ("Right", ViewerAction::Next),
+        ] {
+            if let Ok(binding) = Binding::parse(key) {
+                let chord = binding.trigger.chord;
+                if keys::take_claimed(ctx, owner, chord) && action.is_none() {
+                    action = Some(direction);
+                }
+                // Reserve these keys for the viewer on the next pass even when a toolbar button has focus.
+                keys::capture(ctx, owner, chord);
+            }
+        }
+        action
+    }
+
+    pub fn header(
+        &mut self,
+        ui: &mut Ui,
+        name: &str,
+        position: usize,
+        count: usize,
+        writable: bool,
+    ) -> Option<ViewerAction> {
+        let open = self.open.as_mut()?;
+        let browsing = !open.comments.editing() && !open.comments.saving;
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let tool_label = if open.comments.placing {
+                "Stop adding comments"
+            } else {
+                "Add point comment"
+            };
+            let comment_tool = crate::chrome_icon("note", tool_label)
+                .selected(open.comments.placing)
+                .enabled(browsing && writable && open.comments.available())
+                .show(ui)
+                .clicked();
+            let next = crate::chrome_icon("chevron_right", "Next asset")
+                .enabled(browsing && position + 1 < count)
+                .show(ui)
+                .clicked();
+            Text::new(format!("{} / {count}", position + 1))
+                .role(TypeRole::Caption)
+                .show(ui);
+            let previous = crate::chrome_icon("chevron_left", "Previous asset")
+                .enabled(browsing && position > 0)
+                .show(ui)
+                .clicked();
+            let back = ui
+                .with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let mut back = Button::new(Word::plain("Library"))
+                        .tooltip(Word::plain("Back to library"))
+                        .icon(IconSpec::svg(IconId::new("arrow_left_fixed")))
+                        .enabled(browsing)
+                        .variant(Variant::GHOST);
+                    if !craft::ui::runtime::measure::active(ui.ctx())
+                        && std::mem::take(&mut open.focus_back)
+                    {
+                        back = back.request_focus(FocusRequest::Take);
+                    }
+                    let back = back.show(ui).clicked();
+                    Text::new(name.to_owned())
+                        .role(TypeRole::BodyStrong)
+                        .elide(Elide::Middle)
+                        .show(ui);
+                    back
+                })
+                .inner;
+            if back {
+                Some(ViewerAction::Back)
+            } else if previous {
+                Some(ViewerAction::Previous)
+            } else if next {
+                Some(ViewerAction::Next)
+            } else if comment_tool {
+                Some(ViewerAction::ToggleCommentTool)
+            } else {
+                None
+            }
+        })
+        .inner
+    }
+
+    pub fn body(&mut self, ui: &mut Ui, name: &str, writable: bool) -> Option<ViewerAction> {
+        Self::image(self.open.as_mut()?, ui, name, writable)
+    }
+
+    fn image(
+        open: &mut OpenAsset,
+        ui: &mut Ui,
+        name: &str,
+        writable: bool,
+    ) -> Option<ViewerAction> {
+        let image = match &open.state {
+            ImageState::Ready(image) => image,
+            state => {
+                let (label, detail) = match state {
+                    ImageState::Loading => (Word::plain("Loading image…"), None),
+                    ImageState::Unavailable => (Word::plain("Original unavailable"), None),
+                    ImageState::Unsupported => {
+                        (Word::plain("Preview supports PNG and JPEG images"), None)
+                    }
+                    ImageState::Failed(error) => {
+                        (Word::plain("Could not open image"), Some(error.as_str()))
+                    }
+                    ImageState::Ready(_) => return None,
+                };
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        Text::new(label).show(ui);
+                        if let Some(detail) = detail {
+                            Text::new(detail.to_owned())
+                                .role(TypeRole::Caption)
+                                .shade(Shade::Muted)
+                                .show(ui);
+                        }
+                    });
+                });
+                return None;
+            }
+        };
+        let size = image.size();
+        let document = Size::new(f64::from(size.width), f64::from(size.height));
+        let mut canvas = Canvas::new(Word::plain("Asset image"))
+            .view(open.camera)
+            .document(document);
+        let real = !craft::ui::runtime::measure::active(ui.ctx());
+        if real && std::mem::take(&mut open.jumped) {
+            canvas = canvas.jumped();
+        }
+        let room = ui.available_rect_before_wrap();
+        let mut tool_view = None;
+        let shown = canvas.show_at(ui, room, |ui, body| {
+            RasterDisplay::new(Label::from(name.to_owned()), image)
+                .picture()
+                .show_at(ui, body.rect);
+            if let Some(pass) = tool_pass(&body.env) {
+                tool_view = ToolHost::new().run(ui, &pass, &mut open.hand).view;
+            }
+        });
+        let mut action = None;
+        if real && let Some(space) = &shown.output.space {
+            let (handled, save) = ui
+                .scope_builder(
+                    UiBuilder::new()
+                        .id_salt("viewer-comment-pins")
+                        .max_rect(room),
+                    |ui| open.comments.pins(ui, &space.view, document, writable),
+                )
+                .inner;
+            action = save.map(ViewerAction::EditComment);
+            let mut at = shown.output.click_at();
+            if open.comments.placing
+                && !open.comments.editing()
+                && let Ok(binding) = Binding::parse("Enter")
+            {
+                let ctx = ui.ctx();
+                let canvas_id = shown.output.response.id;
+                let chord = binding.trigger.chord;
+                keys::claim(ctx, canvas_id, chord);
+                if keys::take_claimed(ctx, canvas_id, chord) {
+                    let center = space.view.to_doc(space.view.rect.center());
+                    at = Some(space.view.to_screen(Point::new(
+                        center.x.clamp(0.0, document.width),
+                        center.y.clamp(0.0, document.height),
+                    )));
+                }
+            }
+            if !handled && let Some(at) = at {
+                open.comments
+                    .click_canvas(&space.view, document, at, writable);
+                ui.ctx().request_repaint();
+            }
+        }
+        if real && let Some(camera) = tool_view.or(shown.output.view) {
+            if !open.camera.rect.is_positive() && camera.rect.is_positive() {
+                ui.ctx().request_repaint();
+            }
+            open.camera = camera;
+        }
+        action
+    }
+
+    pub fn status(&mut self, ui: &mut Ui, format: &str) {
+        let Some(open) = &mut self.open else { return };
+        let size = match &open.state {
+            ImageState::Ready(image) => Some(image.size()),
+            _ => None,
+        };
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let Some(size) = size.filter(|_| open.camera.rect.is_positive()) {
+                ControlRow::new().show(ui, |ui, _| open.zoom_controls(ui, size));
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let metadata = size.map_or_else(
+                    || format.to_owned(),
+                    |size| format!("{format} · {} × {} px", size.width, size.height),
+                );
+                Text::new(metadata)
+                    .role(TypeRole::Caption)
+                    .shade(Shade::Muted)
+                    .elide(Elide::End)
+                    .show(ui);
+            });
+        });
+    }
+}
+
+impl OpenAsset {
+    fn zoom_controls(&mut self, ui: &mut Ui, size: PixelSize) {
+        let target = ViewTarget::new(Size::new(f64::from(size.width), f64::from(size.height)));
+        let env = Env::of(ui);
+        let units = env.units();
+        let scheme = env.view().get::<ZoomScheme>();
+        let scale = env.scale.0;
+        let before = self.camera;
+        let mut command = |action: ViewCommands| {
+            let _ = action.apply(&mut self.camera, &target, None, scale, &scheme);
+        };
+        if Button::new(Word::plain("Fit"))
+            .tooltip(Word::plain("Fit image to view"))
+            .variant(Variant::GHOST)
+            .show(ui)
+            .clicked()
+        {
+            command(ViewCommands::FitOnScreen);
+        }
+        if Button::new(Word::plain("100%"))
+            .tooltip(Word::plain("Show actual pixels"))
+            .variant(Variant::GHOST)
+            .show(ui)
+            .clicked()
+        {
+            command(ViewCommands::ActualPixels);
+        }
+        if crate::chrome_icon("minus", "Zoom out").show(ui).clicked() {
+            command(ViewCommands::ZoomOut);
+        }
+        let device = zoom::device(&self.camera, scale);
+        let mut changed = device;
+        let range = scheme.min(target.document).min(device)..=scheme.max_device().max(device);
+        let response = Slider::new(Bind::bound(&mut changed), range)
+            .scale(SliderScale::Log)
+            .short(true)
+            .label(Word::plain("Image zoom"))
+            .value_text(units.zoom_percent(scheme.percent(device)))
+            .size(ControlSize::Md)
+            .show(ui);
+        self.slider_id = Some(response.response.id);
+        if changed != device {
+            self.camera = zoom::with_device(&self.camera, changed, target.document, scale, &scheme);
+        }
+        if crate::chrome_icon("plus", "Zoom in").show(ui).clicked() {
+            let _ = ViewCommands::ZoomIn.apply(&mut self.camera, &target, None, scale, &scheme);
+        }
+        Text::new(units.zoom_percent(scheme.percent(zoom::device(&self.camera, scale))))
+            .role(TypeRole::Caption)
+            .show(ui);
+        if self.camera != before {
+            self.jumped = true;
+            ui.ctx().request_repaint();
+        }
+    }
+}

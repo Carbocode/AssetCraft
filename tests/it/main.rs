@@ -223,11 +223,11 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
 
     fs::rename(fixture.0.join(CATALOG), fixture.0.join("untouched")).unwrap();
     fixture.create();
-    block_on(fixture.execute_sql("PRAGMA user_version = 7"));
+    block_on(fixture.execute_sql("PRAGMA user_version = 8"));
     let expected = fs::read(fixture.0.join(CATALOG)).unwrap();
     let output = fixture.run(["add", CATALOG, "image.png"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("version 7 is unsupported"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version 8 is unsupported"));
     assert_eq!(fs::read(fixture.0.join(CATALOG)).unwrap(), expected);
 
     block_on(fixture.execute_sql("PRAGMA user_version = 5"));
@@ -236,6 +236,118 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("version 5 is unsupported"));
     assert_eq!(fs::read(fixture.0.join(CATALOG)).unwrap(), expected);
+}
+
+#[test]
+fn point_comments_persist_after_migrating_a_version_six_catalog() {
+    let fixture = Fixture::new();
+    fixture.write("original.png", PNG);
+    let original = fixture.0.join("original.png");
+    let baseline = fixture.0.join("baseline.sqlite");
+    let asset = Uuid::new_v4();
+    let library = Uuid::new_v4();
+    block_on(async {
+        let options = SqliteConnectOptions::new()
+            .filename(&baseline)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::raw_sql(include_str!("../../src/schema.sql"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO library (singleton, id, name, created_at_unix_ms) VALUES (1, ?, 'Previous library', 0)")
+            .bind(library.as_bytes().as_slice()).execute(&mut connection).await.unwrap();
+        sqlx::query("INSERT INTO asset VALUES (?, ?, 'original.png', 'png', ?, 0)")
+            .bind(asset.as_bytes().as_slice())
+            .bind(assetcraft::local_file::encode_path(&original))
+            .bind(Sha256::digest(PNG).as_slice())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO asset_details (asset_id, notes) VALUES (?, 'Existing note')")
+            .bind(asset.as_bytes().as_slice())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    });
+    let baseline_bytes = fs::read(&baseline).unwrap();
+    fs::copy(&baseline, fixture.0.join(CATALOG)).unwrap();
+    let asset_id = asset.to_string();
+    assert!(fixture.ok(&["comments", CATALOG, &asset_id]).is_empty());
+    let result = fixture.run(["comment-add", CATALOG, &asset_id, "NaN", "0.5", "Invalid"]);
+    assert!(!result.status.success());
+    let result = fixture.run(["comment-add", CATALOG, &asset_id, "0.5", "0.5", "   "]);
+    assert!(!result.status.success());
+    fixture.ok(&[
+        "comment-add",
+        CATALOG,
+        &asset_id,
+        "0.25",
+        "0.75",
+        "  Check this point  ",
+    ]);
+    assert!(
+        fixture
+            .ok(&["comments", CATALOG, &asset_id])
+            .contains("0.25\t0.75\t\"Check this point\"")
+    );
+    assert_eq!(fs::read(&baseline).unwrap(), baseline_bytes);
+    assert_eq!(fs::read(original).unwrap(), PNG);
+    block_on(async {
+        let mut catalog = Catalog::open(&fixture.0.join(CATALOG)).await.unwrap();
+        assert_eq!(catalog.library().id, library);
+        assert_eq!(catalog.find("").await.unwrap()[0].id, asset);
+        assert_eq!(
+            catalog.organization().await.unwrap().assets[&asset].notes,
+            "Existing note"
+        );
+        assert_eq!(catalog.point_comments(asset).await.unwrap().len(), 1);
+        catalog.close().await.unwrap();
+    });
+}
+
+#[test]
+fn point_comment_edits_keep_text_and_position_independent_and_require_the_owner() {
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("first.png", PNG);
+    fixture.write("second.jpg", JPEG);
+    let first = fixture.ok(&["add", CATALOG, "first.png"]);
+    let second = fixture.ok(&["add", CATALOG, "second.jpg"]);
+    let first = first.split('\t').nth(1).unwrap();
+    let second = second.split('\t').nth(1).unwrap();
+
+    let added = fixture.ok(&["comment-add", CATALOG, first, "0.25", "0.75", "Original"]);
+    let id = added.trim().split('\t').nth(1).unwrap();
+    fixture.ok(&["comment-edit", CATALOG, first, id, "Edited"]);
+    let read = fixture.ok(&["comments", CATALOG, first]);
+    assert_eq!(read.trim(), format!("{id}\t0.25\t0.75\t\"Edited\""));
+
+    fixture.ok(&["comment-move", CATALOG, first, id, "0.8", "0.2"]);
+    let moved = fixture.ok(&["comments", CATALOG, first]);
+    assert_eq!(moved.trim(), format!("{id}\t0.8\t0.2\t\"Edited\""));
+
+    for command in [
+        vec!["comment-edit", CATALOG, second, id, "Wrong asset"],
+        vec!["comment-edit", CATALOG, first, id, "   "],
+        vec!["comment-move", CATALOG, first, id, "1.5", "0.2"],
+        vec!["comment-move", CATALOG, second, id, "0.4", "0.4"],
+        vec!["comment-delete", CATALOG, second, id],
+    ] {
+        assert!(!fixture.run(command).status.success());
+    }
+    assert_eq!(fixture.ok(&["comments", CATALOG, first]), moved);
+    assert!(fixture.ok(&["comments", CATALOG, second]).is_empty());
+
+    fixture.ok(&["comment-delete", CATALOG, first, id]);
+    assert!(fixture.ok(&["comments", CATALOG, first]).is_empty());
+    assert!(
+        !fixture
+            .run(["comment-delete", CATALOG, first, id])
+            .status
+            .success()
+    );
 }
 
 #[test]

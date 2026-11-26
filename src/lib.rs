@@ -20,8 +20,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const APPLICATION_ID: u32 = 0x5354_4346;
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_BASELINE: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const SCHEMA: &str = include_str!("schema.sql");
+const POINT_COMMENTS_SCHEMA: &str = include_str!("schema_7.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -32,6 +34,9 @@ pub enum Error {
     FolderNameExists,
     FolderMissing,
     InvalidRating,
+    InvalidCommentPoint,
+    InvalidCommentText,
+    CommentMissing,
     EmptyTagName,
     TagExists,
     UnknownTag,
@@ -56,6 +61,11 @@ impl fmt::Display for Error {
             Self::TagExists => out.write_str("That tag already exists"),
             Self::UnknownTag => out.write_str("Create the tag in the library before assigning it"),
             Self::InvalidRating => out.write_str("Choose a rating from zero to five stars"),
+            Self::CommentMissing => out.write_str("This comment no longer exists on the image"),
+            Self::InvalidCommentPoint => out.write_str("Choose a point inside the image"),
+            Self::InvalidCommentText => {
+                out.write_str("Enter a comment of 1 to 4096 characters without null characters")
+            }
             Self::FolderMissing => out.write_str("This folder no longer exists"),
             Self::UnrecognizedCatalog => out.write_str("This file is not an AssetCraft catalog"),
             Self::UnsupportedSchema(version) => {
@@ -178,6 +188,14 @@ pub struct AssetDetails {
     pub folders: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointComment {
+    pub id: i64,
+    /// Relative to the image, from its top-left to its bottom-right.
+    pub point: [f64; 2],
+    pub body: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Organization {
     pub assets: HashMap<Uuid, AssetDetails>,
@@ -239,6 +257,9 @@ impl Catalog {
         };
         let mut transaction = db.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::raw_sql(SCHEMA).execute(&mut *transaction).await?;
+        sqlx::raw_sql(POINT_COMMENTS_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("INSERT INTO library (singleton, id, name, created_at_unix_ms, icon, color) VALUES (1, ?, ?, ?, ?, ?)")
             .bind(library.id.as_bytes().as_slice())
             .bind(&library.name)
@@ -287,11 +308,119 @@ impl Catalog {
                 color: row.try_get("color")?,
             },
         };
+        if schema == SCHEMA_BASELINE {
+            let mut transaction = db.begin_with("BEGIN IMMEDIATE").await?;
+            // Another process may have upgraded the catalog while we waited for the lock.
+            let current = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *transaction)
+                .await?;
+            check_version(application_id, current)?;
+            if current == SCHEMA_BASELINE {
+                sqlx::raw_sql(POINT_COMMENTS_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+        }
         Ok(Self { db, library })
     }
 
     pub fn library(&self) -> &Library {
         &self.library
+    }
+
+    pub async fn point_comments(&mut self, asset: Uuid) -> Result<Vec<PointComment>, Error> {
+        sqlx::query("SELECT id, x, y, body FROM asset_comment WHERE asset_id = ? ORDER BY id")
+            .bind(asset.as_bytes().as_slice())
+            .try_map(|row: sqlx::sqlite::SqliteRow| {
+                Ok(PointComment {
+                    id: row.try_get("id")?,
+                    point: [row.try_get("x")?, row.try_get("y")?],
+                    body: row.try_get("body")?,
+                })
+            })
+            .fetch_all(&mut self.db)
+            .await
+            .map_err(Error::from)
+    }
+
+    pub async fn add_point_comment(
+        &mut self,
+        asset: Uuid,
+        point: [f64; 2],
+        body: &str,
+    ) -> Result<PointComment, Error> {
+        let body = comment_text(body)?;
+        validate_comment_point(point)?;
+        let id = sqlx::query_scalar(
+            "INSERT INTO asset_comment (asset_id, x, y, body) VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(asset.as_bytes().as_slice())
+        .bind(point[0])
+        .bind(point[1])
+        .bind(body)
+        .fetch_one(&mut self.db)
+        .await?;
+        Ok(PointComment {
+            id,
+            point,
+            body: body.to_owned(),
+        })
+    }
+
+    pub async fn edit_point_comment(
+        &mut self,
+        asset: Uuid,
+        id: i64,
+        body: &str,
+    ) -> Result<PointComment, Error> {
+        let body = comment_text(body)?;
+        let (x, y) = sqlx::query_as(
+            "UPDATE asset_comment SET body = ? WHERE asset_id = ? AND id = ? RETURNING x, y",
+        )
+        .bind(body)
+        .bind(asset.as_bytes().as_slice())
+        .bind(id)
+        .fetch_optional(&mut self.db)
+        .await?
+        .ok_or(Error::CommentMissing)?;
+        Ok(PointComment {
+            id,
+            point: [x, y],
+            body: body.to_owned(),
+        })
+    }
+
+    pub async fn move_point_comment(
+        &mut self,
+        asset: Uuid,
+        id: i64,
+        point: [f64; 2],
+    ) -> Result<PointComment, Error> {
+        validate_comment_point(point)?;
+        let body = sqlx::query_scalar(
+            "UPDATE asset_comment SET x = ?, y = ? WHERE asset_id = ? AND id = ? RETURNING body",
+        )
+        .bind(point[0])
+        .bind(point[1])
+        .bind(asset.as_bytes().as_slice())
+        .bind(id)
+        .fetch_optional(&mut self.db)
+        .await?
+        .ok_or(Error::CommentMissing)?;
+        Ok(PointComment { id, point, body })
+    }
+
+    pub async fn delete_point_comment(&mut self, asset: Uuid, id: i64) -> Result<(), Error> {
+        let deleted = sqlx::query("DELETE FROM asset_comment WHERE asset_id = ? AND id = ?")
+            .bind(asset.as_bytes().as_slice())
+            .bind(id)
+            .execute(&mut self.db)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            return Err(Error::CommentMissing);
+        }
+        Ok(())
     }
 
     pub async fn set_library_appearance(&mut self, appearance: Appearance) -> Result<(), Error> {
@@ -768,6 +897,21 @@ impl Catalog {
     }
 }
 
+fn comment_text(body: &str) -> Result<&str, Error> {
+    let body = body.trim();
+    if body.is_empty() || body.contains('\0') || body.chars().count() > 4096 {
+        return Err(Error::InvalidCommentText);
+    }
+    Ok(body)
+}
+
+fn validate_comment_point(point: [f64; 2]) -> Result<(), Error> {
+    if !point.iter().all(|value| (0.0..=1.0).contains(value)) {
+        return Err(Error::InvalidCommentPoint);
+    }
+    Ok(())
+}
+
 fn catalog_options() -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .foreign_keys(true)
@@ -843,7 +987,7 @@ fn check_version(application_id: u32, schema: u32) -> Result<(), Error> {
     if application_id != APPLICATION_ID {
         return Err(Error::UnrecognizedCatalog);
     }
-    if schema != SCHEMA_VERSION {
+    if !(SCHEMA_BASELINE..=SCHEMA_VERSION).contains(&schema) {
         return Err(Error::UnsupportedSchema(schema));
     }
     Ok(())
