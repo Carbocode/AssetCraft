@@ -72,8 +72,8 @@ impl PointComments {
         self.comments.is_some()
     }
 
-    pub fn loaded(&mut self, result: Result<Vec<PointComment>, Error>) {
-        self.comments = result.ok();
+    pub fn loaded(&mut self, comments: Vec<PointComment>) {
+        self.comments = Some(comments);
     }
 
     pub fn changed(&mut self, retry: Option<i64>, result: Result<CommentChange, Error>) {

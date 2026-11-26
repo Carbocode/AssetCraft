@@ -223,11 +223,11 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
 
     fs::rename(fixture.0.join(CATALOG), fixture.0.join("untouched")).unwrap();
     fixture.create();
-    block_on(fixture.execute_sql("PRAGMA user_version = 8"));
+    block_on(fixture.execute_sql("PRAGMA user_version = 9"));
     let expected = fs::read(fixture.0.join(CATALOG)).unwrap();
     let output = fixture.run(["add", CATALOG, "image.png"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("version 8 is unsupported"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version 9 is unsupported"));
     assert_eq!(fs::read(fixture.0.join(CATALOG)).unwrap(), expected);
 
     block_on(fixture.execute_sql("PRAGMA user_version = 5"));
@@ -348,6 +348,102 @@ fn point_comment_edits_keep_text_and_position_independent_and_require_the_owner(
             .status
             .success()
     );
+}
+
+#[test]
+fn migrating_version_seven_preserves_comments_and_retires_deleted_ids() {
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("first.png", PNG);
+    let added = fixture.ok(&["add", CATALOG, "first.png"]);
+    let asset = added.split('\t').nth(1).unwrap();
+
+    // Rebuild only the comment table from the original version 7 definition.
+    block_on(fixture.execute_sql("DROP TABLE asset_comment"));
+    block_on(fixture.execute_sql(include_str!("../../src/schema_7.sql")));
+    let path = fixture.0.join(CATALOG);
+    block_on(async {
+        let mut legacy =
+            SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&path))
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO asset_comment VALUES (42, ?, 0.25, 0.75, 'Existing comment')")
+            .bind(Uuid::parse_str(asset).unwrap().as_bytes().as_slice())
+            .execute(&mut legacy)
+            .await
+            .unwrap();
+        legacy.close().await.unwrap();
+    });
+    assert_eq!(
+        fixture.ok(&["comments", CATALOG, asset]).trim(),
+        "42\t0.25\t0.75\t\"Existing comment\""
+    );
+    fixture.ok(&["comment-delete", CATALOG, asset, "42"]);
+    let added = fixture.ok(&["comment-add", CATALOG, asset, "0.5", "0.5", "Replacement"]);
+    assert!(
+        added
+            .trim()
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            > 42
+    );
+    assert!(
+        !fixture
+            .run(["comment-delete", CATALOG, asset, "42"])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .ok(&["comments", CATALOG, asset])
+            .contains("Replacement")
+    );
+}
+
+#[test]
+fn comment_write_reports_a_blocked_commit() {
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("first.png", PNG);
+    let added = fixture.ok(&["add", CATALOG, "first.png"]);
+    let asset = Uuid::parse_str(added.split('\t').nth(1).unwrap()).unwrap();
+
+    block_on(async {
+        let path = fixture.0.join(CATALOG);
+        let mut writer = Catalog::open(&path).await.unwrap();
+        let mut reader =
+            SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&path))
+                .await
+                .unwrap();
+        let mut transaction = reader.begin().await.unwrap();
+        sqlx::query("SELECT id FROM asset_comment")
+            .fetch_all(&mut *transaction)
+            .await
+            .unwrap();
+
+        let result = writer
+            .add_point_comment(asset, [0.25, 0.75], "Blocked")
+            .await;
+        transaction.rollback().await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(assetcraft::Error::Database(sqlx::Error::Database(ref error)))
+                    if error.code().as_deref() == Some("5")
+            ),
+            "{result:?}"
+        );
+        assert!(writer.point_comments(asset).await.unwrap().is_empty());
+
+        writer
+            .add_point_comment(asset, [0.25, 0.75], "Retry")
+            .await
+            .unwrap();
+        assert_eq!(writer.point_comments(asset).await.unwrap()[0].body, "Retry");
+    });
 }
 
 #[test]

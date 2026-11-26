@@ -13,7 +13,7 @@ use craft::egui::{Align, Color32, ColorImage, Id, Layout, Rect, Ui, UiBuilder};
 use craft::host::queue::{JobQueue, Priority, QueueOptions};
 use craft::host::{Host, Wake};
 use craft::i18n::Word;
-use craft::theme::variant::Variant;
+use craft::theme::variant::{Tone, Variant};
 use craft::theme::{ControlSize, TypeRole};
 use craft::ui::buttons::Button;
 use craft::ui::canvas::{
@@ -24,6 +24,7 @@ use craft::ui::canvas::{
 use craft::ui::contract::{Bind, Props, Show, ShowContainer};
 use craft::ui::display::{Elide, Shade, Text};
 use craft::ui::layout_components::Row as ControlRow;
+use craft::ui::notices::{Notice, NoticeAction};
 use craft::ui::primitives::textures::Revision;
 use craft::ui::primitives::{Draw, IconSpec};
 use craft::ui::runtime::commands::Binding;
@@ -154,13 +155,9 @@ enum ImageState {
     Failed(String),
 }
 
-struct LoadedAsset {
-    image: DetailImage,
-    comments: Result<Vec<PointComment>, Error>,
-}
-
 struct OpenAsset {
     id: Uuid,
+    catalog_path: PathBuf,
     state: ImageState,
     camera: CanvasView,
     hand: ViewerPan,
@@ -168,12 +165,14 @@ struct OpenAsset {
     focus_back: bool,
     jumped: bool,
     comments: PointComments,
+    comment_load_error: Option<String>,
 }
 
 pub struct Viewer {
     open: Option<OpenAsset>,
     generation: u64,
-    queue: JobQueue<u64, Result<LoadedAsset, ThumbError>>,
+    queue: JobQueue<u64, Result<DetailImage, ThumbError>>,
+    comment_queue: JobQueue<u64, Result<Vec<PointComment>, Error>>,
 }
 
 impl Viewer {
@@ -183,10 +182,19 @@ impl Viewer {
             generation: 0,
             queue: JobQueue::new(
                 host.jobs_shared().clone(),
-                wake,
+                wake.clone(),
                 QueueOptions {
                     lanes: 1,
                     name: "Load asset viewer",
+                    ..QueueOptions::default()
+                },
+            ),
+            comment_queue: JobQueue::new(
+                host.jobs_shared().clone(),
+                wake,
+                QueueOptions {
+                    lanes: 1,
+                    name: "Load image comments",
                     ..QueueOptions::default()
                 },
             ),
@@ -204,6 +212,7 @@ impl Viewer {
         let generation = self.generation;
         self.open = Some(OpenAsset {
             id: asset.id,
+            catalog_path,
             state: ImageState::Loading,
             camera: CanvasView::new(Rect::NOTHING, Point::ZERO, 1.0),
             hand: ViewerPan {
@@ -214,9 +223,9 @@ impl Viewer {
             focus_back,
             jumped: true,
             comments: PointComments::default(),
+            comment_load_error: None,
         });
         let path = asset.path.clone();
-        let id = asset.id;
         self.queue
             .submit(generation, Priority::VISIBLE, move |cancel| {
                 let original = decode_original(&path, cancel)?;
@@ -226,26 +235,37 @@ impl Viewer {
                 if cancel.is_cancelled() {
                     return Err(ThumbError::Cancelled);
                 }
-                let image = DetailImage {
+                Ok(DetailImage {
                     pixels: ColorImage::from_rgba_unmultiplied(
                         [width as usize, height as usize],
                         &rgba,
                     ),
                     revision: Revision::new(generation),
-                };
-                let comments = block_on(async {
-                    let mut catalog = Catalog::open(&catalog_path).await?;
-                    let comments = catalog.point_comments(id).await?;
-                    catalog.close().await?;
-                    Ok(comments)
-                });
-                Ok(LoadedAsset { image, comments })
+                })
             });
     }
 
     pub fn close(&mut self) {
         self.open = None;
         self.queue.reprioritize(|_, _| None);
+        self.comment_queue.reprioritize(|_, _| None);
+    }
+
+    fn load_comments(
+        queue: &JobQueue<u64, Result<Vec<PointComment>, Error>>,
+        generation: u64,
+        open: &OpenAsset,
+    ) {
+        let path = open.catalog_path.clone();
+        let id = open.id;
+        queue.submit(generation, Priority::VISIBLE, move |_| {
+            block_on(async {
+                let mut catalog = Catalog::open(&path).await?;
+                let comments = catalog.point_comments(id).await?;
+                catalog.close().await?;
+                Ok(comments)
+            })
+        });
     }
 
     pub fn toggle_comment_tool(&mut self) {
@@ -292,15 +312,7 @@ impl Viewer {
                 continue;
             };
             (open.state, announcement) = match finished.result {
-                Ok(loaded) => {
-                    let label = if loaded.comments.is_ok() {
-                        "Preview ready"
-                    } else {
-                        "Preview ready. Could not load comments"
-                    };
-                    open.comments.loaded(loaded.comments);
-                    (ImageState::Ready(loaded.image), Some(Word::plain(label)))
-                }
+                Ok(image) => (ImageState::Ready(image), Some(Word::plain("Preview ready"))),
                 Err(ThumbError::Missing) => (
                     ImageState::Unavailable,
                     Some(Word::plain("Original unavailable")),
@@ -318,6 +330,29 @@ impl Viewer {
                     Some(Word::plain("Could not open image")),
                 ),
             };
+            if matches!(open.state, ImageState::Ready(_)) {
+                Self::load_comments(&self.comment_queue, self.generation, open);
+            }
+        }
+        while let Some(finished) = self.comment_queue.try_recv() {
+            let Some(open) = self
+                .open
+                .as_mut()
+                .filter(|_| finished.key == self.generation)
+            else {
+                continue;
+            };
+            announcement = Some(match finished.result {
+                Ok(comments) => {
+                    open.comments.loaded(comments);
+                    open.comment_load_error = None;
+                    Word::plain("Comments loaded")
+                }
+                Err(error) => {
+                    open.comment_load_error = Some(error.to_string());
+                    Word::plain("Could not load comments")
+                }
+            });
         }
         announcement
     }
@@ -436,7 +471,20 @@ impl Viewer {
     }
 
     pub fn body(&mut self, ui: &mut Ui, name: &str, writable: bool) -> Option<ViewerAction> {
-        Self::image(self.open.as_mut()?, ui, name, writable)
+        let open = self.open.as_mut()?;
+        if let Some(error) = &open.comment_load_error {
+            let notice = Notice::new(Tone::Bad, Word::plain("Could not load comments"))
+                .lines([error.clone()])
+                .action(NoticeAction::new(Word::plain("Retry loading comments")))
+                .show(ui);
+            if notice.action.is_some() {
+                open.comment_load_error = None;
+                Self::load_comments(&self.comment_queue, self.generation, open);
+            }
+        } else if matches!(open.state, ImageState::Ready(_)) && !open.comments.available() {
+            Text::new(Word::plain("Loading comments…")).show(ui);
+        }
+        Self::image(open, ui, name, writable)
     }
 
     fn image(

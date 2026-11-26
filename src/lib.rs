@@ -21,9 +21,10 @@ use uuid::Uuid;
 
 const APPLICATION_ID: u32 = 0x5354_4346;
 const SCHEMA_BASELINE: u32 = 6;
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const SCHEMA: &str = include_str!("schema.sql");
 const POINT_COMMENTS_SCHEMA: &str = include_str!("schema_7.sql");
+const COMMENT_IDS_SCHEMA: &str = include_str!("schema_8.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -260,6 +261,9 @@ impl Catalog {
         sqlx::raw_sql(POINT_COMMENTS_SCHEMA)
             .execute(&mut *transaction)
             .await?;
+        sqlx::raw_sql(COMMENT_IDS_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("INSERT INTO library (singleton, id, name, created_at_unix_ms, icon, color) VALUES (1, ?, ?, ?, ?, ?)")
             .bind(library.id.as_bytes().as_slice())
             .bind(&library.name)
@@ -308,7 +312,7 @@ impl Catalog {
                 color: row.try_get("color")?,
             },
         };
-        if schema == SCHEMA_BASELINE {
+        if schema < SCHEMA_VERSION {
             let mut transaction = db.begin_with("BEGIN IMMEDIATE").await?;
             // Another process may have upgraded the catalog while we waited for the lock.
             let current = sqlx::query_scalar("PRAGMA user_version")
@@ -317,6 +321,11 @@ impl Catalog {
             check_version(application_id, current)?;
             if current == SCHEMA_BASELINE {
                 sqlx::raw_sql(POINT_COMMENTS_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if current < SCHEMA_VERSION {
+                sqlx::raw_sql(COMMENT_IDS_SCHEMA)
                     .execute(&mut *transaction)
                     .await?;
             }
@@ -352,6 +361,7 @@ impl Catalog {
     ) -> Result<PointComment, Error> {
         let body = comment_text(body)?;
         validate_comment_point(point)?;
+        // Drain RETURNING through statement completion so a failed implicit commit is reported.
         let id = sqlx::query_scalar(
             "INSERT INTO asset_comment (asset_id, x, y, body) VALUES (?, ?, ?, ?) RETURNING id",
         )
@@ -359,8 +369,10 @@ impl Catalog {
         .bind(point[0])
         .bind(point[1])
         .bind(body)
-        .fetch_one(&mut self.db)
-        .await?;
+        .fetch_all(&mut self.db)
+        .await?
+        .pop()
+        .ok_or(Error::InvalidRecord("new comment"))?;
         Ok(PointComment {
             id,
             point,
@@ -381,8 +393,9 @@ impl Catalog {
         .bind(body)
         .bind(asset.as_bytes().as_slice())
         .bind(id)
-        .fetch_optional(&mut self.db)
+        .fetch_all(&mut self.db)
         .await?
+        .pop()
         .ok_or(Error::CommentMissing)?;
         Ok(PointComment {
             id,
@@ -405,8 +418,9 @@ impl Catalog {
         .bind(point[1])
         .bind(asset.as_bytes().as_slice())
         .bind(id)
-        .fetch_optional(&mut self.db)
+        .fetch_all(&mut self.db)
         .await?
+        .pop()
         .ok_or(Error::CommentMissing)?;
         Ok(PointComment { id, point, body })
     }

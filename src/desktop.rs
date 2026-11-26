@@ -2865,6 +2865,7 @@ impl Desktop {
                 .max_rect(at(left, right)),
             |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(at(left, right)));
+                self.operation_status(ui);
                 if let Some(at) = viewed {
                     let writable = self.can_write_comment();
                     if let Some(action) =
@@ -2950,7 +2951,7 @@ impl Desktop {
         }
     }
 
-    fn body(&mut self, ui: &mut Ui) {
+    fn operation_status(&self, ui: &mut Ui) {
         if let Some(work) = self.work {
             Text::new(work).show(ui);
         }
@@ -2961,6 +2962,9 @@ impl Desktop {
                 .lines(status.details.iter().cloned())
                 .show(ui);
         }
+    }
+
+    fn body(&mut self, ui: &mut Ui) {
         if self.library.is_none() {
             self.start_screen(ui);
             return;
@@ -3282,6 +3286,7 @@ impl ShellApp for Desktop {
                         if opened {
                             app.workspace(ui);
                         } else {
+                            app.operation_status(ui);
                             app.body(ui);
                         }
                     },
