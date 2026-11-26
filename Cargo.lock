@@ -257,6 +257,7 @@ dependencies = [
  "serde",
  "sha2",
  "sqlx",
+ "tempfile",
  "uuid",
 ]
 
@@ -988,6 +989,7 @@ name = "craft"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs.git?rev=90e14375a4a461fb42eba802846250b2473366f7#90e14375a4a461fb42eba802846250b2473366f7"
 dependencies = [
+ "craft-atomic",
  "craft-automation",
  "craft-behavior",
  "craft-browse",

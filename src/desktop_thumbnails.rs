@@ -1,7 +1,7 @@
 use assetcraft::local_file;
 use craft::behavior::{IconId, PixelSize};
 use craft::browse::thumbs::{
-    DecodeRequest, DecodedThumb, FileThumbKey, FileThumbSource, ThumbDecoder, ThumbError,
+    DecodeRequest, DecodedThumb, FileStat, FileThumbKey, FileThumbSource, ThumbDecoder, ThumbError,
 };
 use craft::egui::{
     Color32, Context, Rect, Stroke,
@@ -33,7 +33,12 @@ const LIMITS: Limits = Limits {
 
 #[derive(Default)]
 struct ImageDecoder {
-    dimensions: Mutex<HashMap<PathBuf, PixelSize>>,
+    originals: Mutex<HashMap<PathBuf, Original>>,
+}
+
+struct Original {
+    stat: Option<FileStat>,
+    dimensions: Option<PixelSize>,
 }
 
 impl ThumbDecoder for ImageDecoder {
@@ -74,8 +79,15 @@ impl ThumbDecoder for ImageDecoder {
                 rgba[start + 3],
             ]
         });
-        if let Ok(mut dimensions) = self.dimensions.lock() {
-            dimensions.insert(path.clone(), size);
+        let stat = FileStat {
+            len: request.len,
+            modified: request.modified,
+        };
+        if let Ok(mut originals) = self.originals.lock()
+            && let Some(original) = originals.get_mut(path)
+            && original.stat == Some(stat)
+        {
+            original.dimensions = Some(size);
         }
         Ok(DecodedThumb {
             width: thumb.size[0] as u32,
@@ -139,13 +151,30 @@ impl Previews {
     }
 
     pub fn dimensions(&self, path: &Path) -> Option<PixelSize> {
-        self.decoder.dimensions.lock().ok()?.get(path).copied()
+        self.decoder.originals.lock().ok()?.get(path)?.dimensions
+    }
+
+    pub fn observe(&self, path: &Path, stat: Option<FileStat>) {
+        let Ok(mut originals) = self.decoder.originals.lock() else {
+            return;
+        };
+        let original = originals.entry(path.to_path_buf()).or_insert(Original {
+            stat,
+            dimensions: None,
+        });
+        if original.stat != stat {
+            *original = Original {
+                stat,
+                dimensions: None,
+            };
+            self.files.invalidate(path);
+        }
     }
 
     pub fn clear(&self) {
         self.files.clear();
-        if let Ok(mut dimensions) = self.decoder.dimensions.lock() {
-            dimensions.clear();
+        if let Ok(mut originals) = self.decoder.originals.lock() {
+            originals.clear();
         }
     }
 

@@ -4,6 +4,7 @@
 pub mod local_file;
 
 use chrono::Utc;
+use craft::atomic::{AtomicFs, RealFs};
 use craft::sniff::{HEAD, Kind, identify};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteSynchronous};
@@ -11,10 +12,10 @@ use sqlx::{Connection, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::fs;
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -224,13 +225,12 @@ impl Catalog {
         if name.is_empty() {
             return Err(Error::EmptyName);
         }
-        // Reserve the destination exclusively before SQLite opens it.
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        options.open(path)?;
-        let mut db = connect(path).await?;
+        let path = database_path(path)?;
+        ensure_catalog_destination_unused(&path)?;
+        // Initialize privately so a failed SQL operation leaves no destination behind.
+        let mut db =
+            SqliteConnection::connect_with(&catalog_options().filename(":memory:").in_memory(true))
+                .await?;
         let library = Library {
             id: Uuid::new_v4(),
             name: name.to_owned(),
@@ -248,13 +248,17 @@ impl Catalog {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
-        Ok(Self { db, library })
+        let bytes = db.serialize(None).await?;
+        db.close().await?;
+        publish_catalog(&path, &bytes)?;
+        Self::open(&path).await
     }
 
     pub async fn open(path: &Path) -> Result<Self, Error> {
+        let path = database_path(path)?;
         // Reject unrelated SQLite databases before SQLite can recover one of their journals.
-        check_header(path)?;
-        let mut db = connect(path).await?;
+        check_header(&path)?;
+        let mut db = SqliteConnection::connect_with(&catalog_options().filename(&path)).await?;
         let application_id: u32 = sqlx::query_scalar("PRAGMA application_id")
             .fetch_one(&mut db)
             .await?;
@@ -764,20 +768,62 @@ impl Catalog {
     }
 }
 
-async fn connect(path: &Path) -> Result<SqliteConnection, Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
+fn catalog_options() -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
         .foreign_keys(true)
         .synchronous(SqliteSynchronous::Full)
-        .pragma("trusted_schema", "OFF");
-    Ok(SqliteConnection::connect_with(&options).await?)
+        .pragma("trusted_schema", "OFF")
+}
+
+fn database_path(path: &Path) -> Result<PathBuf, Error> {
+    let path = std::path::absolute(path)?;
+    if path.to_str().is_none() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "Catalog paths must be UTF-8").into(),
+        );
+    }
+    Ok(path)
+}
+
+fn ensure_catalog_destination_unused(path: &Path) -> io::Result<()> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let candidate = Path::new(&candidate);
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Catalog destination or SQLite sidecar already exists: {}",
+                        candidate.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn publish_catalog(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let mut stage = tempfile::NamedTempFile::with_prefix_in(".assetcraft-", parent)?;
+    stage.write_all(bytes)?;
+    RealFs.sync(stage.as_file())?;
+    ensure_catalog_destination_unused(path)?;
+    drop(stage.persist_noclobber(path)?);
+    // Publication has completed. A directory sync is best effort, as in craft-atomic.
+    let _ = RealFs.sync_dir(parent);
+    Ok(())
 }
 
 fn check_header(path: &Path) -> Result<(), Error> {
-    if !fs::metadata(path)?.is_file() {
+    let mut file = local_file::open_read(path)?;
+    if !file.metadata()?.is_file() {
         return Err(Error::NotARegularFile);
     }
-    let mut file = File::open(path)?;
     let mut header = [0; 72];
     match file.read_exact(&mut header) {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
@@ -817,8 +863,9 @@ fn inspect_file(path: PathBuf) -> Result<Asset, Error> {
     if !before.is_file() {
         return Err(Error::NotARegularFile);
     }
+    let mut original = (&mut file).take(before.len());
     let mut head = Vec::with_capacity(HEAD);
-    (&mut file).take(HEAD as u64).read_to_end(&mut head)?;
+    (&mut original).take(HEAD as u64).read_to_end(&mut head)?;
     let format = match identify(&head) {
         Some(Kind::Png) => Format::Png,
         Some(Kind::Jpeg) => Format::Jpeg,
@@ -826,7 +873,10 @@ fn inspect_file(path: PathBuf) -> Result<Asset, Error> {
     };
     let mut digest = Sha256::new();
     digest.update(head);
-    io::copy(&mut file, &mut digest)?;
+    io::copy(&mut original, &mut digest)?;
+    if original.limit() != 0 {
+        return Err(Error::FileChanged);
+    }
     let after = fs::metadata(&path)?;
     if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
         return Err(Error::FileChanged);

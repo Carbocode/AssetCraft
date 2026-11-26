@@ -52,7 +52,7 @@ target/debug/assetcraft-cli add ./catalog.sqlite /path/to/logo.png /path/to/phot
 target/debug/assetcraft-cli find ./catalog.sqlite logo
 ```
 
-Create a catalog at an unused destination. The CLI identifies PNG and JPEG by file signature. A batch reports rejected files individually and retains successful entries. Search matches a literal, case-sensitive part of the filename. An empty query includes entries whose originals are unavailable.
+Create a catalog at an unused destination. The CLI identifies PNG and JPEG by file signature. A batch reports rejected files individually and retains successful entries. Search matches a literal, case-sensitive substring in an asset's filename or tags. An empty query includes entries whose originals are unavailable.
 
 ## Under the hood
 

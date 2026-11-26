@@ -239,7 +239,56 @@ fn catalog_open_and_create_preserve_unrecognized_or_unsupported_files() {
 }
 
 #[test]
-fn killing_a_cli_batch_rolls_back_its_first_insert() {
+fn catalog_creation_preserves_existing_sidecars() {
+    let fixture = Fixture::new();
+    for suffix in ["journal", "wal", "shm"] {
+        let sidecar = format!("{CATALOG}-{suffix}");
+        fixture.write(&sidecar, b"existing file");
+        let output = fixture.run(["create", CATALOG, "Library"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SQLite sidecar already exists"));
+        let sidecar = fixture.0.join(sidecar);
+        assert_eq!(fs::read(&sidecar).unwrap(), b"existing file");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+        fs::remove_file(sidecar).unwrap();
+    }
+    fixture.create();
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+}
+
+#[test]
+fn concurrent_catalog_creation_keeps_the_winner() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join(CATALOG);
+    let barrier = std::sync::Barrier::new(2);
+    let results = thread::scope(|scope| {
+        ["First library", "Second library"]
+            .map(|name| {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    block_on(async {
+                        let catalog = Catalog::create(path, name).await?;
+                        catalog.close().await?;
+                        Ok::<_, assetcraft::Error>(name)
+                    })
+                })
+            })
+            .map(|thread| thread.join().unwrap())
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    block_on(async {
+        let catalog = Catalog::open(&path).await.unwrap();
+        assert_eq!(catalog.library().name, winner);
+        catalog.close().await.unwrap();
+    });
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+}
+
+#[test]
+fn killing_a_cli_batch_during_a_write_preserves_committed_assets() {
     let fixture = Fixture::new();
     fixture.create();
     fixture.write("kept.png", PNG);
@@ -247,7 +296,7 @@ fn killing_a_cli_batch_rolls_back_its_first_insert() {
     fixture.write("slow.jpg", JPEG);
     fixture.ok(&["add", CATALOG, "kept.png"]);
     let previous = fixture.ok(&["find", CATALOG, ""]);
-    // Delay the second insert until the parent observes the first insert's journal.
+    // Keep the transaction active long enough to observe its rollback journal.
     block_on(fixture.execute_sql(
         "CREATE TRIGGER delay_batch BEFORE INSERT ON asset
          WHEN NEW.display_name = 'slow.jpg'
@@ -281,6 +330,38 @@ fn killing_a_cli_batch_rolls_back_its_first_insert() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(fixture.ok(&["find", CATALOG, ""]), previous);
+}
+
+#[test]
+fn a_failed_second_insert_rolls_back_a_completed_first_insert() {
+    let fixture = Fixture::new();
+    fixture.create();
+    fixture.write("first.png", PNG);
+    fixture.write("second.jpg", JPEG);
+    block_on(fixture.execute_sql(
+        "CREATE TRIGGER reject_second BEFORE INSERT ON asset
+         WHEN NEW.display_name = 'second.jpg'
+           AND EXISTS (SELECT 1 FROM asset WHERE display_name = 'first.png')
+         BEGIN
+            SELECT RAISE(ABORT, 'second insert rejected after first');
+         END;",
+    ));
+
+    let output = fixture.run(["add", CATALOG, "first.png", "second.jpg"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("second insert rejected after first"));
+    assert!(fixture.ok(&["find", CATALOG, ""]).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_invalid_catalog_directory_leaves_no_destination_file() {
+    let fixture = Fixture::new();
+    let directory = fixture.0.join(OsString::from_vec(b"catalog-\xff".to_vec()));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join(CATALOG);
+    assert!(block_on(Catalog::create(&path, "Library")).is_err());
+    assert!(fs::read_dir(directory).unwrap().next().is_none());
 }
 
 #[test]
@@ -535,16 +616,6 @@ fn organization_survives_reopen_and_folder_deletion_preserves_assets() {
         );
         catalog
             .edit_metadata(
-                &ids[..1],
-                &MetadataEdit::Folder {
-                    id: first,
-                    linked: true,
-                },
-            )
-            .await
-            .unwrap();
-        catalog
-            .edit_metadata(
                 &ids,
                 &MetadataEdit::Folder {
                     id: second,
@@ -598,11 +669,20 @@ fn organization_survives_reopen_and_folder_deletion_preserves_assets() {
                 .find_filtered(AssetView::Folder(first), "", Some("Color study"), true)
                 .await
                 .unwrap()
-                .len(),
-            1
+                .iter()
+                .map(|(asset, _)| asset.id)
+                .collect::<Vec<_>>(),
+            ids[..1]
+        );
+        assert!(
+            catalog
+                .find_filtered(AssetView::Folder(first), "", Some("Color study"), false)
+                .await
+                .unwrap()
+                .is_empty()
         );
         let first_asset = &organization.assets[&ids[0]];
-        assert_eq!(first_asset.folders.len(), 3);
+        assert_eq!(first_asset.folders.len(), 2);
         assert_eq!(first_asset.rating, 4);
         assert_eq!(first_asset.notes, "A note\non two lines");
         assert_eq!(catalog.find("study").await.unwrap(), assets[..1]);

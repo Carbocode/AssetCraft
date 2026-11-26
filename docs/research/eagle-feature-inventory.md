@@ -1,6 +1,6 @@
 # Eagle feature inventory
 
-The approved comparison baseline is Eagle 4.0.0 Build 23, released on 1 April 2026 for Windows and macOS. The inventory draws on official public documentation consulted on 25 November 2026. [The decision registry](../decisions/REGISTRY.md) records the baseline under D04a and the approved MVP workflows under D04b. Implementation has yet to start. [Download and release](https://en.eagle.cool/download) · [Desktop support](https://en.eagle.cool/support/desktop)
+The approved comparison baseline is Eagle 4.0.0 Build 23, released on 1 April 2026 for Windows and macOS. The inventory draws on official public documentation consulted on 25 November 2026. [The decision registry](../decisions/REGISTRY.md) records the baseline under D04a and the approved MVP workflows under D04b. The public preview implements local catalogs, referenced PNG and JPEG import, and search in the CLI, with browsing, organization, and trash recovery in the desktop. Original export is still part of the remaining MVP work. [Download and release](https://en.eagle.cool/download) · [Desktop support](https://en.eagle.cool/support/desktop)
 
 The approved demonstration runs on Linux. It includes reopening a local library, batch import of PNG and JPEG with thumbnails and progress, organization and search, trash recovery, and original export. The minimal CLI covers library creation, import, search and export. The table records detailed acceptance proposals for those workflows. Details beyond D04b remain proposals.
 
