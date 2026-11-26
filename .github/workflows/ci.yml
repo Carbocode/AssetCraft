@@ -10,6 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  git-sources:
+    uses: storytold/craft-common-actions/.github/workflows/git-sources.yml@4ec2a14646b538253fd5ebe109bf463a3d31b061
+
   linux:
     uses: storytold/craft-common-actions/.github/workflows/gate.yml@4ec2a14646b538253fd5ebe109bf463a3d31b061
     with:
