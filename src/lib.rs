@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod formats;
 #[doc(hidden)]
 pub mod local_file;
+pub use formats::Format;
 
 use chrono::Utc;
 use craft::atomic::{AtomicFs, RealFs};
-use craft::sniff::{HEAD, Kind, identify};
+use craft::image_codecs::{Detection, Format as ImageCodec, PrefixDetector};
+use craft::sniff::HEAD;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteSynchronous};
 use sqlx::{Connection, Row};
@@ -13,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -21,10 +24,20 @@ use uuid::Uuid;
 
 const APPLICATION_ID: u32 = 0x5354_4346;
 const SCHEMA_BASELINE: u32 = 6;
-const SCHEMA_VERSION: u32 = 8;
+const COMMENT_IDS_VERSION: u32 = 8;
+const RASTER_VERSION: u32 = 9;
+const DOCUMENT_VERSION: u32 = 10;
+const VIDEO_VERSION: u32 = 11;
+const MODEL_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 const SCHEMA: &str = include_str!("schema.sql");
 const POINT_COMMENTS_SCHEMA: &str = include_str!("schema_7.sql");
 const COMMENT_IDS_SCHEMA: &str = include_str!("schema_8.sql");
+const RASTER_SCHEMA: &str = include_str!("schema_9.sql");
+const DOCUMENT_SCHEMA: &str = include_str!("schema_10.sql");
+const VIDEO_SCHEMA: &str = include_str!("schema_11.sql");
+const MODEL_SCHEMA: &str = include_str!("schema_12.sql");
+const EXTENDED_ASSET_SCHEMA: &str = include_str!("schema_13.sql");
 
 #[derive(Debug)]
 pub enum Error {
@@ -75,7 +88,7 @@ impl fmt::Display for Error {
             Self::InvalidRecord(field) => write!(out, "Invalid catalog field {field}"),
             Self::UnexpectedJournal(mode) => write!(out, "Unsupported catalog journal mode {mode}"),
             Self::NotARegularFile => out.write_str("Choose a regular file"),
-            Self::UnsupportedImage => out.write_str("Expected a PNG or JPEG file signature"),
+            Self::UnsupportedImage => out.write_str("Expected a recognized creative asset"),
             Self::FileChanged => out.write_str("The original changed while it was being read"),
         }
     }
@@ -109,21 +122,6 @@ pub struct Library {
     pub name: String,
     pub created_at_unix_ms: i64,
     pub appearance: Appearance,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Png,
-    Jpeg,
-}
-
-impl Format {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Png => "png",
-            Self::Jpeg => "jpeg",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +262,18 @@ impl Catalog {
         sqlx::raw_sql(COMMENT_IDS_SCHEMA)
             .execute(&mut *transaction)
             .await?;
+        sqlx::raw_sql(RASTER_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::raw_sql(DOCUMENT_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::raw_sql(VIDEO_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::raw_sql(MODEL_SCHEMA)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("INSERT INTO library (singleton, id, name, created_at_unix_ms, icon, color) VALUES (1, ?, ?, ?, ?, ?)")
             .bind(library.id.as_bytes().as_slice())
             .bind(&library.name)
@@ -313,6 +323,10 @@ impl Catalog {
             },
         };
         if schema < SCHEMA_VERSION {
+            // Rebuilding the parent table must not fire the asset deletion cascades.
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut db)
+                .await?;
             let mut transaction = db.begin_with("BEGIN IMMEDIATE").await?;
             // Another process may have upgraded the catalog while we waited for the lock.
             let current = sqlx::query_scalar("PRAGMA user_version")
@@ -324,12 +338,47 @@ impl Catalog {
                     .execute(&mut *transaction)
                     .await?;
             }
-            if current < SCHEMA_VERSION {
+            if current < COMMENT_IDS_VERSION {
                 sqlx::raw_sql(COMMENT_IDS_SCHEMA)
                     .execute(&mut *transaction)
                     .await?;
             }
+            if current < RASTER_VERSION {
+                sqlx::raw_sql(RASTER_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+                if sqlx::query("PRAGMA foreign_key_check")
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .is_some()
+                {
+                    return Err(Error::InvalidRecord("foreign keys"));
+                }
+            }
+            if current < DOCUMENT_VERSION {
+                sqlx::raw_sql(DOCUMENT_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if current < VIDEO_VERSION {
+                sqlx::raw_sql(VIDEO_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if current < MODEL_VERSION {
+                sqlx::raw_sql(MODEL_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if current < SCHEMA_VERSION {
+                sqlx::raw_sql(EXTENDED_ASSET_SCHEMA)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
             transaction.commit().await?;
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut db)
+                .await?;
         }
         Ok(Self { db, library })
     }
@@ -539,9 +588,13 @@ impl Catalog {
     }
 
     pub async fn folders(&mut self) -> Result<Vec<Folder>, Error> {
+        Self::read_folders(&mut self.db).await
+    }
+
+    async fn read_folders(db: &mut SqliteConnection) -> Result<Vec<Folder>, Error> {
         let rows =
             sqlx::query("SELECT id, parent_id, name, icon, color FROM folder ORDER BY name, id")
-                .fetch_all(&mut self.db)
+                .fetch_all(db)
                 .await?;
         rows.iter()
             .map(|row| {
@@ -668,6 +721,33 @@ impl Catalog {
         tag: Option<&str>,
         include_subfolders: bool,
     ) -> Result<Vec<(Asset, AssetState)>, Error> {
+        Self::read_filtered(&mut self.db, view, needle, tag, include_subfolders).await
+    }
+
+    /// Read search results, folders and their memberships from one catalog snapshot.
+    pub async fn browse_snapshot(
+        &mut self,
+        view: AssetView,
+        needle: &str,
+        tag: Option<&str>,
+        include_subfolders: bool,
+    ) -> Result<(Vec<(Asset, AssetState)>, Vec<Folder>, Organization), Error> {
+        let mut snapshot = self.db.begin().await?;
+        let rows =
+            Self::read_filtered(&mut snapshot, view, needle, tag, include_subfolders).await?;
+        let folders = Self::read_folders(&mut snapshot).await?;
+        let organization = Self::read_organization(&mut snapshot).await?;
+        snapshot.commit().await?;
+        Ok((rows, folders, organization))
+    }
+
+    async fn read_filtered(
+        db: &mut SqliteConnection,
+        view: AssetView,
+        needle: &str,
+        tag: Option<&str>,
+        include_subfolders: bool,
+    ) -> Result<Vec<(Asset, AssetState)>, Error> {
         let mut query = sqlx::QueryBuilder::new(
             "SELECT asset.*, COALESCE(favorite, 0) AS favorite, COALESCE(trashed, 0) AS trashed
              FROM asset LEFT JOIN asset_state ON asset_state.asset_id = asset.id
@@ -723,7 +803,7 @@ impl Catalog {
         } else {
             query.push(" ORDER BY display_name, path");
         }
-        let rows = query.build().fetch_all(&mut self.db).await?;
+        let rows = query.build().fetch_all(db).await?;
         rows.iter()
             .map(|row| {
                 Ok((
@@ -738,9 +818,15 @@ impl Catalog {
     }
 
     pub async fn organization(&mut self) -> Result<Organization, Error> {
+        let mut snapshot = self.db.begin().await?;
+        let result = Self::read_organization(&mut snapshot).await?;
+        snapshot.commit().await?;
+        Ok(result)
+    }
+
+    async fn read_organization(db: &mut SqliteConnection) -> Result<Organization, Error> {
         let mut result = Organization::default();
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let mut snapshot = self.db.begin().await?;
         let totals = sqlx::query(
             "WITH active AS (
                  SELECT a.id, a.imported_at_unix_ms, s.favorite
@@ -753,7 +839,7 @@ impl Catalog {
                 COUNT(CASE WHEN NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = active.id) THEN 1 END) AS untagged,
                 (SELECT COUNT(*) FROM asset_state WHERE trashed = 1) AS trash
              FROM active",
-        ).bind(cutoff.timestamp_millis()).fetch_one(&mut *snapshot).await?;
+        ).bind(cutoff.timestamp_millis()).fetch_one(&mut *db).await?;
         for (view, field) in [
             (AssetView::All, "total"),
             (AssetView::Recent, "recent"),
@@ -766,7 +852,7 @@ impl Catalog {
                 .insert(view, totals.try_get::<i64, _>(field)? as u64);
         }
         let details = sqlx::query("SELECT asset_id AS id, rating, notes FROM asset_details")
-            .fetch_all(&mut *snapshot)
+            .fetch_all(&mut *db)
             .await?;
         for row in details {
             result.assets.insert(
@@ -779,14 +865,14 @@ impl Catalog {
             );
         }
         let names = sqlx::query_scalar::<_, String>("SELECT name FROM library_tag")
-            .fetch_all(&mut *snapshot)
+            .fetch_all(&mut *db)
             .await?;
         result.tags.extend(names.into_iter().map(|tag| (tag, 0)));
         let tags = sqlx::query(
             "SELECT t.asset_id AS id, tag, COALESCE(s.trashed, 0) AS trashed FROM asset_tag t
             LEFT JOIN asset_state s ON s.asset_id = t.asset_id ORDER BY tag",
         )
-        .fetch_all(&mut *snapshot)
+        .fetch_all(&mut *db)
         .await?;
         for row in tags {
             let tag: String = row.try_get("tag")?;
@@ -801,7 +887,7 @@ impl Catalog {
         }
         let folders = sqlx::query("SELECT f.asset_id AS id, folder_id, COALESCE(s.trashed, 0) AS trashed FROM folder_asset f
             LEFT JOIN asset_state s ON s.asset_id = f.asset_id")
-            .fetch_all(&mut *snapshot).await?;
+            .fetch_all(&mut *db).await?;
         for row in folders {
             let bytes: Vec<u8> = row.try_get("folder_id")?;
             let folder = Uuid::from_slice(&bytes).map_err(|_| Error::InvalidRecord("folder ID"))?;
@@ -815,7 +901,6 @@ impl Catalog {
                 .folders
                 .push(folder);
         }
-        snapshot.commit().await?;
         Ok(result)
     }
 
@@ -1024,10 +1109,66 @@ fn inspect_file(path: PathBuf) -> Result<Asset, Error> {
     let mut original = (&mut file).take(before.len());
     let mut head = Vec::with_capacity(HEAD);
     (&mut original).take(HEAD as u64).read_to_end(&mut head)?;
-    let format = match identify(&head) {
-        Some(Kind::Png) => Format::Png,
-        Some(Kind::Jpeg) => Format::Jpeg,
-        _ => return Err(Error::UnsupportedImage),
+    let mut detector = PrefixDetector::new();
+    let detected = Format::document(&path, &head)
+        .or_else(|| Format::additional(&path, &head))
+        .or_else(|| Format::video(&head))
+        .or_else(|| Format::model(&path, &head, before.len()));
+    let detected = if detected.is_none() && Format::lottie_name(&path) {
+        let mut probe = head.clone();
+        (&mut original)
+            .take((Format::LOTTIE_JSON_PROBE_BYTES - probe.len()) as u64)
+            .read_to_end(&mut probe)?;
+        original.set_limit(before.len() - head.len() as u64);
+        original
+            .get_mut()
+            .seek(SeekFrom::Start(head.len() as u64))?;
+        Format::lottie_json(&path, &probe)
+    } else {
+        detected
+    };
+    let format = if let Some(format) = detected {
+        format
+    } else {
+        loop {
+            match detector.detect(&head) {
+                Detection::NeedBytes(next)
+                    if next <= (1024 * 1024) && next as u64 <= before.len() =>
+                {
+                    let additional = next - head.len();
+                    (&mut original)
+                        .take(additional as u64)
+                        .read_to_end(&mut head)?;
+                    if head.len() < next {
+                        return Err(Error::FileChanged);
+                    }
+                }
+                Detection::NeedBytes(_) => break Format::Jpeg,
+                Detection::Format(codec) => {
+                    const TGA_FOOTER: &[u8; 18] = b"TRUEVISION-XFILE.\0";
+                    if codec == ImageCodec::Tga && before.len() >= TGA_FOOTER.len() as u64 {
+                        let mut footer = [0; TGA_FOOTER.len()];
+                        let source = original.get_mut();
+                        source.seek(SeekFrom::End(-(TGA_FOOTER.len() as i64)))?;
+                        source.read_exact(&mut footer)?;
+                        source.seek(SeekFrom::Start(head.len() as u64))?;
+                        if &footer == TGA_FOOTER {
+                            break Format::Tga;
+                        }
+                    }
+                    break Format::from_prefix(&path, &head, codec)
+                        .ok_or(Error::UnsupportedImage)?;
+                }
+                Detection::Unknown => {
+                    let format = Format::bundle(&path, &head, original.get_mut())
+                        .ok_or(Error::UnsupportedImage)?;
+                    original
+                        .get_mut()
+                        .seek(SeekFrom::Start(head.len() as u64))?;
+                    break format;
+                }
+            }
+        }
     };
     let mut digest = Sha256::new();
     digest.update(head);
@@ -1080,11 +1221,7 @@ fn read_id(row: &sqlx::sqlite::SqliteRow) -> Result<Uuid, Error> {
 }
 
 fn read_asset(row: &sqlx::sqlite::SqliteRow) -> Result<Asset, Error> {
-    let format = match row.try_get::<&str, _>("format")? {
-        "png" => Format::Png,
-        "jpeg" => Format::Jpeg,
-        _ => return Err(Error::InvalidRecord("format")),
-    };
+    let format = Format::from_id(row.try_get("format")?).ok_or(Error::InvalidRecord("format"))?;
     let bytes: Vec<u8> = row.try_get("path")?;
     let path = local_file::decode_path(bytes).ok_or(Error::InvalidRecord("path"))?;
     Ok(Asset {

@@ -1,6 +1,6 @@
 [package]
 name = "assetcraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -17,18 +17,44 @@ path = "src/desktop.rs"
 required-features = ["desktop"]
 
 [features]
-desktop = ["craft/ui-app", "craft/dialogs", "craft/image-codecs", "craft/settings", "craft/window", "dep:eframe", "dep:serde"]
+desktop = [
+    "craft/ui-app", "craft/color", "craft/dialogs", "craft/image-codecs-avif-decode",
+    "craft/image-codecs-heif", "craft/image-codecs-jxl", "craft/settings", "craft/window",
+    "craft/svg-tree-render-system-fonts", "craft/pdf-raster", "craft/font-catalog",
+    "craft/raw-cr3", "craft/psd", "craft/designcraft-format",
+    "craft/pcraft-format", "craft/media-isobmff", "craft/media-matroska",
+    "craft/video-h264-decode", "craft/video-prores", "craft/video-vp9-decode",
+    "craft/mesh-abc", "craft/mesh-dae", "craft/mesh-fbx", "craft/mesh-gltf",
+    "craft/mesh-obj", "craft/mesh-ply", "craft/mesh-stl", "craft/mesh-threemf",
+    "craft/dxf", "craft/dwg", "dep:eframe", "dep:flate2", "dep:serde", "dep:serde_json",
+    "craft/xcf", "craft/palette", "craft/usd", "craft/materialx", "craft/lottie",
+    "craft/sketch", "craft/aep", "craft/audio-decode", "craft/audio-flac-decode",
+    "craft/audio-mp3-decode", "craft/audio-aac-decode", "craft/audio-alac-decode",
+    "craft/audio-opus-decode", "craft/audio-vorbis-decode",
+    "craft/media-avi", "craft/media-mxf", "craft/media-mpegts",
+    "craft/video-hevc-decode", "craft/video-av1-decode", "craft/video-vp8-decode",
+    "craft/video-dnx", "craft/video-mjpeg", "craft/video-mpeg2-decode",
+    "dep:cap-primitives", "dep:basisu", "dep:ktx2", "dep:harfrust", "dep:skrifa", "dep:wuff",
+]
 
 [dependencies]
+cap-primitives = { version = "=4.0.3", optional = true }
+basisu = { version = "=0.1.0", optional = true }
+ktx2 = { version = "=0.5.0", optional = true }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
-craft = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7", default-features = false, features = ["atomic", "sniff"] }
+craft = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7", default-features = false, features = ["atomic", "image-codecs", "image-codecs-sgi", "image-codecs-sunraster", "sniff", "eps", "svg", "raw", "zip", "vectorcraft-format"] }
 eframe = { version = "=0.37.0", optional = true, default-features = false, features = ["accesskit"] }
+flate2 = { version = "=1.1.11", optional = true, default-features = false }
 futures-executor = "=0.3.32"
+harfrust = { version = "=0.13.3", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "=1.0.154", optional = true }
 sha2 = "=0.10.9"
+skrifa = { version = "=0.47.0", optional = true }
 sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite-bundled", "sqlite-deserialize"] }
 tempfile = "=3.27.0"
 uuid = { version = "=1.27.0", default-features = false, features = ["v4"] }
+wuff = { version = "=0.2.10", optional = true, default-features = false, features = ["brotli"] }
 
 [[test]]
 name = "integration"
@@ -45,3 +71,12 @@ egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f3
 egui_glow = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
 eframe = { git = "https://github.com/storytold/egui.git", rev = "b9770908e0f304896f9658d239a7b29cf8af1564" }
 winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+
+hayro = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+hayro-interpret = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+hayro-syntax = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+hayro-jbig2 = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+hayro-cmap = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+hayro-postscript = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+vello_cpu = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }
+vello_common = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4a461fb42eba802846250b2473366f7" }

@@ -1,8 +1,11 @@
 use crate::{
     desktop_comments::{CommentChange, CommentEdit, PointComments},
-    desktop_thumbnails::decode_original,
+    desktop_player::Player,
+    desktop_scene_viewer::SceneViewer,
+    desktop_thumbnails::decode_preview,
+    desktop_transport::Transport,
 };
-use assetcraft::{Asset, Catalog, Error, PointComment};
+use assetcraft::{Asset, Catalog, Error, Format, PointComment};
 use craft::behavior::{
     CancelReason, CanvasView, Cursor, CursorIcon, IconId, PixelSize, ZoomScheme,
     canvas::zoom,
@@ -13,6 +16,7 @@ use craft::egui::{Align, Color32, ColorImage, Id, Layout, Rect, Ui, UiBuilder};
 use craft::host::queue::{JobQueue, Priority, QueueOptions};
 use craft::host::{Host, Wake};
 use craft::i18n::Word;
+use craft::image_codecs::Image;
 use craft::theme::variant::{Tone, Variant};
 use craft::theme::{ControlSize, TypeRole};
 use craft::ui::buttons::Button;
@@ -35,7 +39,12 @@ use craft::ui::runtime::overlay::{OpenFilter, any_open};
 use craft::ui::value_drag::{Slider, SliderScale};
 use futures_executor::block_on;
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
+
+#[path = "desktop_font_viewer.rs"]
+mod desktop_font_viewer;
+use desktop_font_viewer::FontViewer;
 
 pub enum ViewerAction {
     Back,
@@ -103,18 +112,80 @@ impl CanvasTool for ViewerPan {
     }
 }
 
-struct DetailImage {
+struct DetailFrame {
     pixels: ColorImage,
-    revision: Revision,
+    duration: Duration,
+}
+
+impl DetailFrame {
+    fn new(image: Image, delay_ms: u32) -> Self {
+        let (width, height) = image.dimensions();
+        Self {
+            pixels: ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &image.to_rgba8(),
+            ),
+            duration: Duration::from_millis(u64::from(delay_ms.max(20))),
+        }
+    }
+}
+
+struct DetailImage {
+    frames: Vec<DetailFrame>,
+    index: usize,
+    transport: Transport,
+    timestamps: Vec<i64>,
+    duration_ns: i64,
+    generation: u64,
+    animation_error: Option<String>,
+}
+
+impl DetailImage {
+    fn current(&self) -> &DetailFrame {
+        &self.frames[self.index]
+    }
+
+    fn control_animation(&mut self, ui: &mut Ui) -> Option<Id> {
+        if self.frames.len() <= 1 {
+            return None;
+        }
+        let real = !craft::ui::runtime::measure::active(ui.ctx());
+        if real {
+            self.transport
+                .advance_at_frames(ui, self.duration_ns, &self.timestamps);
+        }
+        let (input, slider) = self
+            .transport
+            .controls(ui, self.duration_ns, &self.timestamps);
+        if real {
+            if let Some(ns) = input.seek {
+                self.transport.pause();
+                self.transport.seek(ns);
+            } else if input.toggle {
+                if self.transport.playing() {
+                    self.transport.pause();
+                } else {
+                    self.transport.play(self.duration_ns);
+                }
+                ui.ctx().request_repaint();
+            }
+            self.index = self
+                .timestamps
+                .partition_point(|&ns| ns <= self.transport.position)
+                .saturating_sub(1);
+        }
+        Some(slider)
+    }
 }
 
 impl RasterSource for DetailImage {
     fn size(&self) -> PixelSize {
-        PixelSize::new(self.pixels.size[0] as u32, self.pixels.size[1] as u32)
+        let [width, height] = self.current().pixels.size;
+        PixelSize::new(width as u32, height as u32)
     }
 
     fn revision(&self) -> Revision {
-        self.revision
+        Revision::of(&(self.generation, self.index))
     }
 
     fn damage(&self, _since: Revision) -> Option<PixelRect> {
@@ -122,7 +193,8 @@ impl RasterSource for DetailImage {
     }
 
     fn read(&self, region: PixelRect, factor: u32, out: &mut ColorImage) {
-        let [width, height] = self.pixels.size;
+        let pixels = &self.current().pixels;
+        let [width, height] = pixels.size;
         let factor = i64::from(factor);
         let stride = out.size[0];
         if stride == 0 {
@@ -134,7 +206,7 @@ impl RasterSource for DetailImage {
                 row.fill(Color32::TRANSPARENT);
                 continue;
             }
-            let source = &self.pixels.pixels[y as usize * width..][..width];
+            let source = &pixels.pixels[y as usize * width..][..width];
             for (x, pixel) in row.iter_mut().enumerate() {
                 let x = i64::from(region.x0) + x as i64 * factor;
                 *pixel = if (0..width as i64).contains(&x) && x < i64::from(region.x1) {
@@ -157,11 +229,13 @@ enum ImageState {
 
 struct OpenAsset {
     id: Uuid,
+    format: Format,
     catalog_path: PathBuf,
     state: ImageState,
     camera: CanvasView,
     hand: ViewerPan,
     slider_id: Option<Id>,
+    transport_slider: Option<Id>,
     focus_back: bool,
     jumped: bool,
     comments: PointComments,
@@ -171,6 +245,9 @@ struct OpenAsset {
 pub struct Viewer {
     open: Option<OpenAsset>,
     generation: u64,
+    scene: SceneViewer,
+    player: Player,
+    font: FontViewer,
     queue: JobQueue<u64, Result<DetailImage, ThumbError>>,
     comment_queue: JobQueue<u64, Result<Vec<PointComment>, Error>>,
 }
@@ -180,6 +257,9 @@ impl Viewer {
         Self {
             open: None,
             generation: 0,
+            scene: SceneViewer::new(host, wake.clone()),
+            player: Player::new(host, wake.clone()),
+            font: FontViewer::new(host, wake.clone()),
             queue: JobQueue::new(
                 host.jobs_shared().clone(),
                 wake.clone(),
@@ -212,7 +292,8 @@ impl Viewer {
         let generation = self.generation;
         self.open = Some(OpenAsset {
             id: asset.id,
-            catalog_path,
+            format: asset.format,
+            catalog_path: catalog_path.clone(),
             state: ImageState::Loading,
             camera: CanvasView::new(Rect::NOTHING, Point::ZERO, 1.0),
             hand: ViewerPan {
@@ -220,33 +301,76 @@ impl Viewer {
                 dragging: false,
             },
             slider_id: None,
+            transport_slider: None,
             focus_back,
             jumped: true,
             comments: PointComments::default(),
             comment_load_error: None,
         });
+        if asset.format.is_model() {
+            self.scene.open(asset, catalog_path);
+            return;
+        }
+        if asset.format.is_video() || asset.format.is_audio() {
+            self.player.open(asset);
+            return;
+        }
+        if asset.format.is_font() {
+            self.font.open(asset);
+            return;
+        }
         let path = asset.path.clone();
         self.queue
             .submit(generation, Priority::VISIBLE, move |cancel| {
-                let original = decode_original(&path, cancel)?;
-                let (width, height) = original.dimensions();
-                let rgba = original.to_rgba8();
-                drop(original);
+                let preview = decode_preview(&path, cancel)?;
+                let (animation, animation_error) = match preview.animation {
+                    Ok(frames) => (frames, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                let frames = if animation.len() > 1 {
+                    drop(preview.image);
+                    let mut frames = Vec::with_capacity(animation.len());
+                    for frame in animation {
+                        if cancel.is_cancelled() {
+                            return Err(ThumbError::Cancelled);
+                        }
+                        frames.push(DetailFrame::new(frame.image, frame.delay_ms));
+                    }
+                    frames
+                } else {
+                    vec![DetailFrame::new(preview.image, 0)]
+                };
                 if cancel.is_cancelled() {
                     return Err(ThumbError::Cancelled);
                 }
+                let mut duration_ns = 0;
+                let timestamps = frames
+                    .iter()
+                    .map(|frame| {
+                        let start = duration_ns;
+                        duration_ns += frame.duration.as_nanos() as i64;
+                        start
+                    })
+                    .collect();
+                let mut transport = Transport::default();
+                transport.looping = true;
                 Ok(DetailImage {
-                    pixels: ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        &rgba,
-                    ),
-                    revision: Revision::new(generation),
+                    frames,
+                    index: 0,
+                    transport,
+                    timestamps,
+                    duration_ns,
+                    generation,
+                    animation_error,
                 })
             });
     }
 
     pub fn close(&mut self) {
         self.open = None;
+        self.scene.close();
+        self.player.close();
+        self.font.close();
         self.queue.reprioritize(|_, _| None);
         self.comment_queue.reprioritize(|_, _| None);
     }
@@ -302,7 +426,9 @@ impl Viewer {
     }
 
     pub fn receive(&mut self) -> Option<Word> {
-        let mut announcement = None;
+        let mut announcement = self.scene.receive();
+        announcement = self.player.receive().or(announcement);
+        announcement = self.font.receive().or(announcement);
         while let Some(finished) = self.queue.try_recv() {
             let Some(open) = self
                 .open
@@ -319,7 +445,9 @@ impl Viewer {
                 ),
                 Err(ThumbError::Unsupported) => (
                     ImageState::Unsupported,
-                    Some(Word::plain("Preview supports PNG and JPEG images")),
+                    Some(Word::plain(
+                        "Preview unavailable for this format or variant",
+                    )),
                 ),
                 Err(ThumbError::Cancelled) => continue,
                 Err(error) => (
@@ -327,7 +455,7 @@ impl Viewer {
                         ThumbError::Failed(detail) => detail,
                         _ => format!("{error:?}"),
                     }),
-                    Some(Word::plain("Could not open image")),
+                    Some(Word::plain("Could not open preview")),
                 ),
             };
             if matches!(open.state, ImageState::Ready(_)) {
@@ -377,10 +505,16 @@ impl Viewer {
             }
             return Some(ViewerAction::Back);
         }
-        let slider_focused = open.slider_id.is_some_and(|id| focus::has(ctx, id));
+        let slider_focused = [open.slider_id, open.transport_slider]
+            .into_iter()
+            .flatten()
+            .any(|id| focus::has(ctx, id));
         if slider_focused
             || open.comments.editing()
             || open.comments.saving
+            || (open.format.is_font() && self.font.control_focused(ctx))
+            || (open.format.is_audio() && self.player.control_focused(ctx))
+            || (open.format.is_model() && self.scene.projection_focused(ctx))
             || focus::focused_rec(ctx).is_some_and(|focused| focused.stop.text)
         {
             return None;
@@ -419,11 +553,15 @@ impl Viewer {
             } else {
                 "Add point comment"
             };
-            let comment_tool = crate::chrome_icon("note", tool_label)
-                .selected(open.comments.placing)
-                .enabled(browsing && writable && open.comments.available())
-                .show(ui)
-                .clicked();
+            let comment_tool = !open.format.is_model()
+                && !open.format.is_video()
+                && !open.format.is_audio()
+                && !open.format.is_font()
+                && crate::chrome_icon("note", tool_label)
+                    .selected(open.comments.placing)
+                    .enabled(browsing && writable && open.comments.available())
+                    .show(ui)
+                    .clicked();
             let next = crate::chrome_icon("chevron_right", "Next asset")
                 .enabled(browsing && position + 1 < count)
                 .show(ui)
@@ -448,10 +586,12 @@ impl Viewer {
                         back = back.request_focus(FocusRequest::Take);
                     }
                     let back = back.show(ui).clicked();
-                    Text::new(name.to_owned())
-                        .role(TypeRole::BodyStrong)
-                        .elide(Elide::Middle)
-                        .show(ui);
+                    if !open.format.is_audio() {
+                        Text::new(name.to_owned())
+                            .role(TypeRole::BodyStrong)
+                            .elide(Elide::Middle)
+                            .show(ui);
+                    }
                     back
                 })
                 .inner;
@@ -472,6 +612,18 @@ impl Viewer {
 
     pub fn body(&mut self, ui: &mut Ui, name: &str, writable: bool) -> Option<ViewerAction> {
         let open = self.open.as_mut()?;
+        if open.format.is_model() {
+            self.scene.show(ui, name);
+            return None;
+        }
+        if open.format.is_video() || open.format.is_audio() {
+            open.transport_slider = self.player.show(ui, name);
+            return None;
+        }
+        if open.format.is_font() {
+            self.font.show(ui);
+            return None;
+        }
         if let Some(error) = &open.comment_load_error {
             let notice = Notice::new(Tone::Bad, Word::plain("Could not load comments"))
                 .lines([error.clone()])
@@ -483,6 +635,14 @@ impl Viewer {
             }
         } else if matches!(open.state, ImageState::Ready(_)) && !open.comments.available() {
             Text::new(Word::plain("Loading comments…")).show(ui);
+        }
+        if let ImageState::Ready(image) = &mut open.state {
+            open.transport_slider = image.control_animation(ui);
+            if let Some(error) = &image.animation_error {
+                Notice::new(Tone::Bad, Word::plain("Could not play animation"))
+                    .lines([error.clone()])
+                    .show(ui);
+            }
         }
         Self::image(open, ui, name, writable)
     }
@@ -497,13 +657,14 @@ impl Viewer {
             ImageState::Ready(image) => image,
             state => {
                 let (label, detail) = match state {
-                    ImageState::Loading => (Word::plain("Loading image…"), None),
+                    ImageState::Loading => (Word::plain("Loading preview…"), None),
                     ImageState::Unavailable => (Word::plain("Original unavailable"), None),
-                    ImageState::Unsupported => {
-                        (Word::plain("Preview supports PNG and JPEG images"), None)
-                    }
+                    ImageState::Unsupported => (
+                        Word::plain("Preview unavailable for this format or variant"),
+                        None,
+                    ),
                     ImageState::Failed(error) => {
-                        (Word::plain("Could not open image"), Some(error.as_str()))
+                        (Word::plain("Could not open preview"), Some(error.as_str()))
                     }
                     ImageState::Ready(_) => return None,
                 };
@@ -583,7 +744,7 @@ impl Viewer {
         action
     }
 
-    pub fn status(&mut self, ui: &mut Ui, format: &str) {
+    pub fn status(&mut self, ui: &mut Ui, format: Format) {
         let Some(open) = &mut self.open else { return };
         let size = match &open.state {
             ImageState::Ready(image) => Some(image.size()),
@@ -594,9 +755,10 @@ impl Viewer {
                 ControlRow::new().show(ui, |ui, _| open.zoom_controls(ui, size));
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let metadata = size.map_or_else(
-                    || format.to_owned(),
-                    |size| format!("{format} · {} × {} px", size.width, size.height),
+                let label = format.name();
+                let metadata = size.filter(|_| format.codec().is_some()).map_or_else(
+                    || label.to_owned(),
+                    |size| format!("{label} · {} × {} px", size.width, size.height),
                 );
                 Text::new(metadata)
                     .role(TypeRole::Caption)
