@@ -18,10 +18,15 @@
 
 <p align="center">
   <a href="#features">Features</a> ·
+  <a href="#screenshots">Screenshots</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#cli">CLI</a> ·
   <a href="#under-the-hood">Under the hood</a> ·
   <a href="#contributing">Contributing</a>
+</p>
+
+<p align="center">
+  <a href="#screenshots"><img src="docs/screenshots/assetcraft-020.webp" width="880" alt="The AssetCraft 0.2.0 desktop app showing a color-coded creative library and the Flight Helmet model in the HDR-lit 3D viewer"></a>
 </p>
 
 ## Features
@@ -48,6 +53,16 @@
 | Animation and design projects | First-frame previews of supported Lottie and dotLottie vector shapes, embedded Sketch previews, and metadata for After Effects projects. |
 
 Preview support depends on the encoding, linked resources, and content inside each file. The current preview covers a subset of Lottie shapes, EPS payloads, and USD geometry. After Effects composition playback and full MaterialX shader rendering are outside the current preview coverage.
+
+## Screenshots
+
+These captures show the Linux desktop preview with a selection from the format test library. Open an image for a larger view.
+
+| Creative library | Interactive 3D | Media and fonts |
+| --- | --- | --- |
+| [![A grid of assets and color-coded folders](docs/screenshots/creative-library.webp)](docs/screenshots/creative-library.webp) | [![Flight Helmet in the HDR-lit viewport and wireframe view](docs/screenshots/model-viewer.webp)](docs/screenshots/model-viewer.webp) | [![The video player, audio waveform, and editable font specimen](docs/screenshots/media-and-fonts.webp)](docs/screenshots/media-and-fonts.webp) |
+
+[See the full preview gallery](docs/screenshots/README.md) · [Sample credits](ATTRIBUTION.md#preview-gallery)
 
 ## Get started
 

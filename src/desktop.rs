@@ -199,6 +199,16 @@ const APPEARANCE_ICONS: &[(&str, &str)] = &[
     ("brush", "Brush"),
     ("file", "Document"),
     ("play", "Play"),
+    ("scan", "Scan"),
+    ("pen_tool", "Vector"),
+    ("text", "Typography"),
+    ("layers", "Layers"),
+    ("swatch_book", "Swatches"),
+    ("diamond", "Geometry"),
+    ("ruler", "Measurement"),
+    ("chart_line", "Signal"),
+    ("keyframe_linear", "Keyframe"),
+    ("globe", "World"),
 ];
 
 fn appearance_icon(appearance: &Appearance) -> IconSpec<'static> {
