@@ -6,7 +6,7 @@ use craft::browse::thumbs::ThumbError;
 use craft::host::queue::Cancel;
 use craft::image_codecs::{Image, Limits};
 use craft::svg::tree::draw::tiny_skia::{
-    FillRule, Paint, Path as ShapePath, PathBuilder, Pixmap, Rect, Transform,
+    FillRule, Paint, Path as ShapePath, PathBuilder, Pixmap, PixmapPaint, Rect, Transform,
 };
 use serde_json::Value as Json;
 
@@ -239,10 +239,8 @@ fn lottie_poster(
     let mut pixmap =
         Pixmap::new(width, height).ok_or_else(|| failed("Invalid animation canvas"))?;
     let frame = header.in_point;
-    let mut work = LottieWork {
-        segments_left: 2048,
-        next_opacity_group: 1,
-    };
+    let mut segments_left = 2048;
+    let mut compositing_pixels_left = 64_000_000;
     for layer in layers.iter().rev().take(2048) {
         if cancel.is_cancelled() {
             return Err(ThumbError::Cancelled);
@@ -259,29 +257,31 @@ fn lottie_poster(
         }
         if let Some(shapes) = layer["shapes"].as_array() {
             let (pose, opacity) = lottie_pose(&layer["ks"], frame);
-            let transform = pose.post_scale(scale as f32, scale as f32);
-            let mut fills = Vec::new();
+            if opacity <= 0.0 {
+                continue;
+            }
+            let mut work = LottieWork {
+                segments_left,
+                groups: vec![LottieGroup::new(opacity)],
+            };
             lottie_shapes(
                 shapes,
                 frame,
                 LottieScope {
-                    transform,
-                    opacity,
-                    opacity_group: 0,
+                    transform: pose.post_scale(scale as f32, scale as f32),
+                    group: 0,
                 },
                 0,
                 &mut work,
-                &mut fills,
             );
-            for fill in fills.into_iter().rev() {
-                pixmap.fill_path(
-                    &fill.path,
-                    &fill.paint,
-                    fill.rule,
-                    Transform::identity(),
-                    None,
-                );
-            }
+            segments_left = work.segments_left;
+            composite_lottie_group(
+                0,
+                &work.groups,
+                &mut pixmap,
+                &mut compositing_pixels_left,
+                cancel,
+            )?;
         }
     }
     if !pixmap
@@ -336,28 +336,89 @@ fn lottie_pose(pose: &Json, frame: f64) -> (Transform, f32) {
     )
 }
 
-#[derive(Clone, Copy)]
 struct LottieScope {
     transform: Transform,
-    opacity: f32,
-    opacity_group: usize,
+    group: usize,
 }
 
 struct LottieWork {
     segments_left: usize,
-    next_opacity_group: usize,
+    groups: Vec<LottieGroup>,
 }
 
 struct LottiePath {
     shape: ShapePath,
-    opacity: f32,
-    opacity_group: usize,
+    group: usize,
 }
 
-struct LottieFill {
-    path: ShapePath,
-    paint: Paint<'static>,
-    rule: FillRule,
+struct LottieGroup {
+    opacity: f32,
+    draws: Vec<LottieDraw>,
+}
+
+impl LottieGroup {
+    fn new(opacity: f32) -> Self {
+        Self {
+            opacity,
+            draws: Vec::new(),
+        }
+    }
+}
+
+enum LottieDraw {
+    Fill(ShapePath, Paint<'static>, FillRule),
+    Group(usize),
+}
+
+fn composite_lottie_group(
+    index: usize,
+    groups: &[LottieGroup],
+    destination: &mut Pixmap,
+    pixels_left: &mut u64,
+    cancel: &Cancel,
+) -> Result<(), ThumbError> {
+    let group = &groups[index];
+    if group.draws.is_empty() {
+        return Ok(());
+    }
+    // Paint the group's contents, including child groups, before applying its opacity.
+    let mut layer = if group.opacity < 1.0 {
+        let (width, height) = (destination.width(), destination.height());
+        *pixels_left = pixels_left
+            .checked_sub(u64::from(width) * u64::from(height))
+            .ok_or_else(|| failed("Lottie groups exceed the compositing budget"))?;
+        Some(Pixmap::new(width, height).ok_or_else(|| failed("Invalid animation group canvas"))?)
+    } else {
+        None
+    };
+    let target = layer.as_mut().unwrap_or(destination);
+    for draw in group.draws.iter().rev() {
+        if cancel.is_cancelled() {
+            return Err(ThumbError::Cancelled);
+        }
+        match draw {
+            LottieDraw::Fill(path, paint, rule) => {
+                target.fill_path(path, paint, *rule, Transform::identity(), None);
+            }
+            LottieDraw::Group(child) => {
+                composite_lottie_group(*child, groups, target, pixels_left, cancel)?;
+            }
+        }
+    }
+    if let Some(layer) = layer {
+        destination.draw_pixmap(
+            0,
+            0,
+            layer.as_ref(),
+            &PixmapPaint {
+                opacity: group.opacity,
+                ..PixmapPaint::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+    Ok(())
 }
 
 fn lottie_shapes(
@@ -366,17 +427,15 @@ fn lottie_shapes(
     scope: LottieScope,
     depth: usize,
     work: &mut LottieWork,
-    fills: &mut Vec<LottieFill>,
 ) -> Vec<LottiePath> {
-    if depth >= 24 || scope.opacity <= 0.0 {
+    if depth >= 24 {
         return Vec::new();
     }
     let mut paths: Vec<LottiePath> = Vec::new();
     let transformed = |shape: ShapePath| {
         shape.transform(scope.transform).map(|shape| LottiePath {
             shape,
-            opacity: scope.opacity,
-            opacity_group: scope.opacity_group,
+            group: scope.group,
         })
     };
     for item in items.iter().filter(|item| item["hd"] != true) {
@@ -416,20 +475,17 @@ fn lottie_shapes(
                 } else {
                     FillRule::Winding
                 };
-                for run in paths.chunk_by(|a, b| a.opacity_group == b.opacity_group) {
+                for run in paths.chunk_by(|a, b| a.group == b.group) {
                     let mut combined = PathBuilder::new();
                     for path in run {
                         combined.push_path(&path.shape);
                     }
                     if let Some(path) = combined.finish() {
                         let mut paint = Paint::default();
-                        paint.set_color_rgba8(
-                            r,
-                            g,
-                            b,
-                            (alpha * run[0].opacity * 255.0).round() as u8,
-                        );
-                        fills.push(LottieFill { path, paint, rule });
+                        paint.set_color_rgba8(r, g, b, (alpha * 255.0).round() as u8);
+                        work.groups[run[0].group]
+                            .draws
+                            .push(LottieDraw::Fill(path, paint, rule));
                     }
                 }
             }
@@ -472,24 +528,28 @@ fn lottie_shapes(
                         .map_or((Transform::identity(), 1.0), |child| {
                             lottie_pose(child, frame)
                         });
-                    let opacity_group = if alpha < 1.0 {
-                        let group = work.next_opacity_group;
-                        work.next_opacity_group += 1;
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    let group = if alpha < 1.0 {
+                        let group = work.groups.len();
+                        work.groups.push(LottieGroup::new(alpha));
+                        work.groups[scope.group]
+                            .draws
+                            .push(LottieDraw::Group(group));
                         group
                     } else {
-                        scope.opacity_group
+                        scope.group
                     };
                     paths.extend(lottie_shapes(
                         children,
                         frame,
                         LottieScope {
                             transform: pose.post_concat(scope.transform),
-                            opacity: scope.opacity * alpha,
-                            opacity_group,
+                            group,
                         },
                         depth + 1,
                         work,
-                        fills,
                     ));
                 }
             }

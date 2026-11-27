@@ -1813,6 +1813,14 @@ fn lottie_parent_fill_preserves_child_group_opacity() {
                 {"ty":"rc","p":{"k":[54,20]},"s":{"k":[8,8]}},
                 {"ty":"tr","o":{"k":50}}
             ]},
+            {"ty":"gr","it":[
+                {"ty":"rc","p":{"k":[66,20]},"s":{"k":[8,8]}},
+                {"ty":"gr","it":[
+                    {"ty":"rc","p":{"k":[70,20]},"s":{"k":[8,8]}},
+                    {"ty":"tr","o":{"k":50}}
+                ]},
+                {"ty":"tr","o":{"k":50}}
+            ]},
             {"ty":"fl","c":{"k":[0,1,0,1]}}
         ]}]
     }"#;
@@ -1824,6 +1832,9 @@ fn lottie_parent_fill_preserves_child_group_opacity() {
     assert_eq!(pixels[(20 * 80 + 48) * 4 + 3], 128);
     assert_eq!(pixels[(20 * 80 + 52) * 4 + 3], 192);
     assert_eq!(pixels[(20 * 80 + 56) * 4 + 3], 128);
+    assert_eq!(pixels[(20 * 80 + 64) * 4 + 3], 128);
+    assert_eq!(pixels[(20 * 80 + 68) * 4 + 3], 128);
+    assert_eq!(pixels[(20 * 80 + 72) * 4 + 3], 64);
 }
 
 #[cfg(feature = "desktop")]
