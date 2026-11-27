@@ -58,6 +58,14 @@ mod desktop_models;
 #[path = "../../src/desktop_video.rs"]
 mod desktop_video;
 
+#[cfg(all(feature = "desktop", target_os = "linux"))]
+#[path = "../../src/desktop_sound.rs"]
+#[expect(
+    dead_code,
+    reason = "Only the decoder entry point is exercised without PipeWire"
+)]
+mod desktop_sound;
+
 const CATALOG: &str = "catalog.sqlite";
 
 #[cfg(feature = "desktop")]
@@ -2138,6 +2146,11 @@ fn large_movie_keeps_its_audio_edit_and_can_seek_to_pcm() {
     let cancel = Cancel::new();
     let video = desktop_video::stream::Video::open(&path, Format::Mov, &cancel).unwrap();
     assert_eq!(video.audio_offset(), Some(2_000_000_000));
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        desktop_sound::duration(&path, Format::Mov, &cancel).unwrap(),
+        2_000_000_000
+    );
     let file = assetcraft::local_file::open_read(&path).unwrap();
     let mut audio = desktop_movie_audio::MovieAudio::open(file, &cancel).unwrap();
     assert_eq!(audio.info(), (8000, 1, Some(16000)));

@@ -29,11 +29,7 @@ use craft::host::queue::{JobQueue, Priority, QueueOptions};
 use craft::host::queue::Cancel;
 
 #[cfg(target_os = "linux")]
-#[path = "desktop_movie_audio.rs"]
-mod movie_audio;
-
-#[cfg(target_os = "linux")]
-use movie_audio::MovieAudio;
+use crate::desktop_movie_audio::MovieAudio;
 
 pub struct Sound {
     #[cfg(target_os = "linux")]

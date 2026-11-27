@@ -6,6 +6,8 @@ mod desktop_comments;
 mod desktop_documents;
 mod desktop_extra;
 mod desktop_models;
+#[cfg(target_os = "linux")]
+mod desktop_movie_audio;
 mod desktop_player;
 mod desktop_recents;
 mod desktop_scene_render;
