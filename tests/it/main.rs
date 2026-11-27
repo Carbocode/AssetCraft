@@ -2077,10 +2077,12 @@ fn large_movie_keeps_its_audio_edit_and_can_seek_to_pcm() {
         .unwrap();
     file.set_len(bytes.len() as u64 + u64::from(padding) - 8)
         .unwrap();
+    drop(file);
 
     let cancel = Cancel::new();
     let video = desktop_video::stream::Video::open(&path, Format::Mov, &cancel).unwrap();
     assert_eq!(video.audio_offset(), Some(2_000_000_000));
+    let file = assetcraft::local_file::open_read(&path).unwrap();
     let mut audio = desktop_movie_audio::MovieAudio::open(file, &cancel).unwrap();
     assert_eq!(audio.info(), (8000, 1, Some(16000)));
     audio.seek(8000);
