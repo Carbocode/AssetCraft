@@ -239,7 +239,10 @@ fn lottie_poster(
     let mut pixmap =
         Pixmap::new(width, height).ok_or_else(|| failed("Invalid animation canvas"))?;
     let frame = header.in_point;
-    let mut budget = 2048usize;
+    let mut work = LottieWork {
+        segments_left: 2048,
+        next_opacity_group: 1,
+    };
     for layer in layers.iter().rev().take(2048) {
         if cancel.is_cancelled() {
             return Err(ThumbError::Cancelled);
@@ -261,10 +264,13 @@ fn lottie_poster(
             lottie_shapes(
                 shapes,
                 frame,
-                transform,
-                opacity,
+                LottieScope {
+                    transform,
+                    opacity,
+                    opacity_group: 0,
+                },
                 0,
-                &mut budget,
+                &mut work,
                 &mut fills,
             );
             for fill in fills.into_iter().rev() {
@@ -330,9 +336,22 @@ fn lottie_pose(pose: &Json, frame: f64) -> (Transform, f32) {
     )
 }
 
+#[derive(Clone, Copy)]
+struct LottieScope {
+    transform: Transform,
+    opacity: f32,
+    opacity_group: usize,
+}
+
+struct LottieWork {
+    segments_left: usize,
+    next_opacity_group: usize,
+}
+
 struct LottiePath {
     shape: ShapePath,
     opacity: f32,
+    opacity_group: usize,
 }
 
 struct LottieFill {
@@ -344,26 +363,27 @@ struct LottieFill {
 fn lottie_shapes(
     items: &[Json],
     frame: f64,
-    transform: Transform,
-    opacity: f32,
+    scope: LottieScope,
     depth: usize,
-    budget: &mut usize,
+    work: &mut LottieWork,
     fills: &mut Vec<LottieFill>,
 ) -> Vec<LottiePath> {
-    if depth >= 24 || opacity <= 0.0 {
+    if depth >= 24 || scope.opacity <= 0.0 {
         return Vec::new();
     }
     let mut paths: Vec<LottiePath> = Vec::new();
     let transformed = |shape: ShapePath| {
-        shape
-            .transform(transform)
-            .map(|shape| LottiePath { shape, opacity })
+        shape.transform(scope.transform).map(|shape| LottiePath {
+            shape,
+            opacity: scope.opacity,
+            opacity_group: scope.opacity_group,
+        })
     };
     for item in items.iter().filter(|item| item["hd"] != true) {
-        let Some(left) = budget.checked_sub(1) else {
+        let Some(left) = work.segments_left.checked_sub(1) else {
             break;
         };
-        *budget = left;
+        work.segments_left = left;
         match item["ty"].as_str() {
             Some(kind @ ("el" | "rc")) => {
                 let [x, y] = lottie_pair(&item["p"], frame, [0.0; 2]);
@@ -383,10 +403,10 @@ fn lottie_shapes(
                     continue;
                 };
                 let segments = paths.iter().map(|path| path.shape.verbs().len()).sum();
-                let Some(left) = budget.checked_sub(segments) else {
+                let Some(left) = work.segments_left.checked_sub(segments) else {
                     break;
                 };
-                *budget = left;
+                work.segments_left = left;
                 let [r, g, b] = [0, 1, 2].map(|i| {
                     (rgb[i].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8
                 });
@@ -396,7 +416,7 @@ fn lottie_shapes(
                 } else {
                     FillRule::Winding
                 };
-                for run in paths.chunk_by(|a, b| a.opacity == b.opacity) {
+                for run in paths.chunk_by(|a, b| a.opacity_group == b.opacity_group) {
                     let mut combined = PathBuilder::new();
                     for path in run {
                         combined.push_path(&path.shape);
@@ -416,10 +436,10 @@ fn lottie_shapes(
             Some("sh") => {
                 if let Some(path) = lottie_value(&item["ks"], frame)
                     .and_then(|value| craft::lottie::Bezier::from_json(value, false))
-                    && path.vertices.len() <= *budget
+                    && path.vertices.len() <= work.segments_left
                     && let Some(&[x, y]) = path.vertices.first()
                 {
-                    *budget -= path.vertices.len();
+                    work.segments_left -= path.vertices.len();
                     let mut builder = PathBuilder::new();
                     builder.move_to(x as f32, y as f32);
                     let segments = path.vertices.len() - usize::from(!path.closed);
@@ -452,13 +472,23 @@ fn lottie_shapes(
                         .map_or((Transform::identity(), 1.0), |child| {
                             lottie_pose(child, frame)
                         });
+                    let opacity_group = if alpha < 1.0 {
+                        let group = work.next_opacity_group;
+                        work.next_opacity_group += 1;
+                        group
+                    } else {
+                        scope.opacity_group
+                    };
                     paths.extend(lottie_shapes(
                         children,
                         frame,
-                        pose.post_concat(transform),
-                        opacity * alpha,
+                        LottieScope {
+                            transform: pose.post_concat(scope.transform),
+                            opacity: scope.opacity * alpha,
+                            opacity_group,
+                        },
                         depth + 1,
-                        budget,
+                        work,
                         fills,
                     ));
                 }
