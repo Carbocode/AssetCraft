@@ -614,3 +614,61 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+AssetCraft preview gallery credits
+
+Flight Helmet glTF sample, © 2018 Public, CC0 1.0 Universal.
+Gary Hsu converted the model from Maya.
+https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/FlightHelmet
+
+Blue Marble Next Generation imagery: NASA Earth Observatory, public domain.
+The gallery uses test-library derivatives and an original globe animation.
+https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/base-topography-bathymetry/
+
+Camera RAW specimens: raw.pixls.us contributors, CC0 1.0 Universal.
+https://raw.pixls.us/
+
+Typeface specimens use fonts under the SIL Open Font License 1.1.
+Roboto: Copyright 2011 The Roboto Project Authors.
+Noto Sans CJK: Copyright the Noto Project Authors.
+Source Sans 3: Copyright 2010–2024 Adobe, with Reserved Font Name “Source”.
+The gallery contains rendered glyphs.
+
+MaterialX gold sample: MaterialX contributors, Apache License 2.0.
+Craft FBX sample: ArtCraft Team and contributors, MIT or Apache License 2.0.
+
+OpenEXR Images sample notice for Blobbies and ColorCodedLevels follows.
+
+Copyright (c) 2004, Industrial Light & Magic, a division of Lucasfilm
+Entertainment Company Ltd.  Portions contributed and copyright held by
+others as indicated.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above
+      copyright notice, this list of conditions and the following
+      disclaimer.
+
+    * Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided with
+      the distribution.
+
+    * Neither the name of Industrial Light & Magic nor the names of
+      any other contributors to this software may be used to endorse or
+      promote products derived from this software without specific prior
+      written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
