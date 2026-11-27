@@ -40,6 +40,7 @@ Statuses are `PROPOSED`, `UNDER REVIEW`, `APPROVED`, `REJECTED`, `DEFERRED`, and
 | AC-R3 | APPROVED | Catalog MP4, QuickTime, WebM and Matroska, show video metadata and decode bounded still previews for H.264, ProRes and VP9 without reading the entire original. Migrate the catalog to version 11. | The owner requested “Vai con la fase 3”. |
 | AC-R4 | APPROVED | Catalog GLB, glTF, OBJ, STL, PLY, 3MF, FBX, COLLADA, Alembic, DXF and DWG with static geometry previews and properties. Use the isolated Craft DWG worker and scope linked model reads to the model directory. Migrate catalogs to version 12. | The owner requested “Vai implementa” and clarified “Fai tutte le estensioni, non dividere in 2”. |
 | AC-R5 | APPROVED | Catalog audio, XCF, GIMP palettes, USD, MaterialX, AVI, MXF, MPEG transport streams, Lottie, dotLottie, Sketch, After Effects, KTX, KTX2 and Basis Universal. Expand the video preview matrix and migrate catalogs to version 13. | The owner requested “Ok aggiungi” and clarified “Tutto”. |
+| AC-V3 | APPROVED | Open animated imagery and supported media in a player, with a timeline and frame stepping. Open models in a dedicated orbit viewer with pan, zoom, grid, wireframe, directional lighting and a selectable HDR environment. | The owner approved the first player and 3D block with “vai” and requested HDRI selection, light direction and a grid. |
 
 Future architectural decision records belong under `docs/decisions/adr/`.
 

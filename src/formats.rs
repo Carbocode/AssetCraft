@@ -163,6 +163,13 @@ impl Format {
         )
     }
 
+    pub fn is_font(self) -> bool {
+        matches!(
+            self,
+            Self::Ttf | Self::Otf | Self::Ttc | Self::Woff | Self::Woff2
+        )
+    }
+
     pub fn is_model(self) -> bool {
         matches!(
             self,

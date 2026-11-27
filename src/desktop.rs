@@ -6,9 +6,14 @@ mod desktop_comments;
 mod desktop_documents;
 mod desktop_extra;
 mod desktop_models;
+mod desktop_player;
 mod desktop_recents;
+mod desktop_scene_render;
+mod desktop_scene_viewer;
+mod desktop_sound;
 mod desktop_textures;
 mod desktop_thumbnails;
+mod desktop_transport;
 mod desktop_video;
 mod desktop_viewer;
 
@@ -39,7 +44,9 @@ use craft::ui::contract::{
 use craft::ui::dialog::{Dialog, DialogHost};
 use craft::ui::display::{Divider, Elide, Icon, Picture, Shade, Text};
 use craft::ui::layout_components::{Row as ControlRow, Stack};
-use craft::ui::list::{List, ListRow, ListWords, OpenSet, ThumbAspect, label_color_label};
+use craft::ui::list::{
+    List, ListRow, ListWords, OpenSet, ThumbAspect, TreeLeaves, label_color_label,
+};
 use craft::ui::menu::{Menu, MenuItem};
 use craft::ui::notices::Notice;
 use craft::ui::popover::DropVeil;
@@ -55,11 +62,11 @@ use craft::ui::shell::embed::CloseDecision;
 use craft::ui::shell::{
     AppShell, RecentSort, RecentView, ShellRegion, StartAction, StartLayout, StartScreen, TitleBar,
 };
-use craft::ui::style::{DataColor, GlyphRole, Ink, UiTokens};
+use craft::ui::style::{DataColor, GlyphRole, Ink, StyleCx, UiTokens};
 use craft::ui::table::Table;
 use craft::ui::text::TextField;
 use craft::ui::tile_grid::{
-    CaptionPlace, GridZoom, Tile, TileGrid, TileStatus, TileZoom, ZoomStep,
+    CaptionPlace, GridEvent, GridZoom, Tile, TileGrid, TileGroup, TileStatus, TileZoom, ZoomStep,
 };
 use craft::ui::value_drag::Slider;
 use craft::window::Prefix;
@@ -73,7 +80,7 @@ use desktop_viewer::{Viewer, ViewerAction};
 use futures_executor::block_on;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -154,7 +161,7 @@ struct Browse {
     filters: Filters,
     order: AssetOrder,
     shuffle: Uuid,
-    include_subfolders: bool,
+    hide_subfolders: bool,
 }
 
 impl Browse {
@@ -325,34 +332,225 @@ struct FileInfo {
     modified: Option<SystemTime>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GridEntry {
+    Asset { id: Uuid, folder: Option<Uuid> },
+    Folder(Uuid),
+}
+
+impl GridEntry {
+    fn asset(self) -> Option<Uuid> {
+        match self {
+            Self::Asset { id, .. } => Some(id),
+            Self::Folder(_) => None,
+        }
+    }
+}
+
+fn unique_assets(entries: &[GridEntry]) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter_map(|entry| entry.asset())
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+#[derive(Default)]
+struct AssetGrid {
+    entries: Vec<GridEntry>,
+    positions: HashMap<GridEntry, usize>,
+    groups: Vec<TileGroup<GridEntry>>,
+    visible_assets: Vec<Uuid>,
+    visible_positions: HashMap<Uuid, usize>,
+}
+
+impl AssetGrid {
+    fn prepare(
+        rows: &[Row],
+        browse: &Browse,
+        folders: &[Folder],
+        organization: &Organization,
+        collapsed: &HashSet<Uuid>,
+    ) -> Self {
+        let parent = browse.folder();
+        let sections = parent
+            .filter(|_| !browse.hide_subfolders)
+            .map_or_else(Vec::new, |parent| {
+                folder_sections(folders, parent, collapsed)
+            });
+        let (entries, groups) = if sections.is_empty() {
+            let entries = rows
+                .iter()
+                .map(|row| GridEntry::Asset {
+                    id: row.asset.id,
+                    folder: parent,
+                })
+                .collect::<Vec<_>>();
+            (entries, Vec::new())
+        } else {
+            let indices: HashMap<_, _> = sections
+                .iter()
+                .enumerate()
+                .filter(|(_, (folder, _))| !collapsed.contains(&folder.id))
+                .map(|(at, (folder, _))| (folder.id, at + 1))
+                .chain(parent.map(|id| (id, 0)))
+                .collect();
+            let mut entries = vec![Vec::new(); sections.len() + 1];
+            for row in rows {
+                let id = row.asset.id;
+                if let Some(details) = organization.assets.get(&id) {
+                    for folder in &details.folders {
+                        if let Some(&at) = indices.get(folder) {
+                            entries[at].push(GridEntry::Asset {
+                                id,
+                                folder: Some(*folder),
+                            });
+                        }
+                    }
+                } else {
+                    entries[0].push(GridEntry::Asset { id, folder: parent });
+                }
+            }
+            let mut groups = Vec::with_capacity(sections.len());
+            let mut start = entries[0].len();
+            for ((folder, depth), members) in sections.into_iter().zip(&entries[1..]) {
+                groups.push(
+                    TileGroup::new(
+                        GridEntry::Folder(folder.id),
+                        start,
+                        members.len(),
+                        &folder.name,
+                    )
+                    .open(!collapsed.contains(&folder.id))
+                    .depth(depth)
+                    .icon(IconId::new("folder")),
+                );
+                start += members.len();
+            }
+            (entries.into_iter().flatten().collect(), groups)
+        };
+        let positions = entries
+            .iter()
+            .enumerate()
+            .map(|(at, key)| (*key, at))
+            .collect();
+        let visible_assets = unique_assets(&entries);
+        let visible_positions = visible_assets
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(at, id)| (id, at))
+            .collect();
+        Self {
+            entries,
+            positions,
+            groups,
+            visible_assets,
+            visible_positions,
+        }
+    }
+
+    fn retain_selection(&self, selection: &mut Selection<GridEntry>) {
+        if selection.items.is_empty() && selection.lead.is_none() && selection.anchor.is_none() {
+            return;
+        }
+        let mut first_placements = HashMap::new();
+        let mut restore = |key: GridEntry| {
+            if self.positions.contains_key(&key) || self.groups.iter().any(|group| group.key == key)
+            {
+                return Some(key);
+            }
+            let id = key.asset()?;
+            if first_placements.is_empty() {
+                for &entry in &self.entries {
+                    if let Some(id) = entry.asset() {
+                        first_placements.entry(id).or_insert(entry);
+                    }
+                }
+            }
+            first_placements.get(&id).copied()
+        };
+        let mut seen = HashSet::new();
+        selection.items = selection
+            .items
+            .iter()
+            .copied()
+            .filter_map(&mut restore)
+            .filter(|key| seen.insert(*key))
+            .collect();
+        selection.lead = selection.lead.and_then(&mut restore);
+        selection.anchor = selection.anchor.and_then(restore);
+    }
+}
+
+fn folder_sections<'a>(
+    folders: &'a [Folder],
+    parent: Uuid,
+    collapsed: &HashSet<Uuid>,
+) -> Vec<(&'a Folder, usize)> {
+    let mut children: HashMap<Uuid, Vec<&Folder>> = HashMap::new();
+    for folder in folders {
+        if let Some(above) = folder.parent {
+            children.entry(above).or_default().push(folder);
+        }
+    }
+    let mut pending: Vec<_> = children
+        .remove(&parent)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|folder| (folder, 0))
+        .collect();
+    let mut sections = Vec::new();
+    while let Some((folder, depth)) = pending.pop() {
+        if !collapsed.contains(&folder.id)
+            && let Some(branch) = children.remove(&folder.id)
+        {
+            pending.extend(branch.into_iter().rev().map(|child| (child, depth + 1)));
+        }
+        sections.push((folder, depth));
+    }
+    sections
+}
+
 struct Assets<'a> {
     rows: &'a [Row],
     positions: &'a HashMap<Uuid, usize>,
+    grid: &'a AssetGrid,
     previews: &'a Previews,
 }
 
-impl DisplayOrder<Uuid> for Assets<'_> {
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn key(&self, at: usize) -> Uuid {
-        self.rows[at].asset.id
-    }
-
-    fn index_of(&self, key: &Uuid) -> Option<usize> {
-        self.positions.get(key).copied()
-    }
-
-    fn text(&self, at: usize) -> Option<Cow<'_, str>> {
-        Some(Cow::Borrowed(&self.rows[at].asset.display_name))
+impl Assets<'_> {
+    fn row(&self, key: &GridEntry) -> Option<&Row> {
+        let at = self.positions.get(&key.asset()?)?;
+        self.rows.get(*at)
     }
 }
 
-impl ItemSource<Uuid> for Assets<'_> {
+impl DisplayOrder<GridEntry> for Assets<'_> {
+    fn len(&self) -> usize {
+        self.grid.entries.len()
+    }
+
+    fn key(&self, at: usize) -> GridEntry {
+        self.grid.entries[at]
+    }
+
+    fn index_of(&self, key: &GridEntry) -> Option<usize> {
+        self.grid.positions.get(key).copied()
+    }
+
+    fn text(&self, at: usize) -> Option<Cow<'_, str>> {
+        self.row(&self.key(at))
+            .map(|row| Cow::Borrowed(row.asset.display_name.as_str()))
+    }
+}
+
+impl ItemSource<GridEntry> for Assets<'_> {
     fn size_hint(&self, at: usize) -> SizeHint {
-        self.previews
-            .dimensions(&self.rows[at].asset.path)
+        self.row(&self.key(at))
+            .and_then(|row| self.previews.dimensions(&row.asset.path))
             .map_or(SizeHint::Auto, |size| {
                 SizeHint::Aspect(size.width as f32 / size.height.max(1) as f32)
             })
@@ -582,7 +780,7 @@ async fn lookup(catalog: &mut Catalog, browse: &Browse) -> Result<Vec<Row>, Erro
             browse.view.clone(),
             &browse.query,
             browse.filters.tag.as_deref(),
-            browse.include_subfolders,
+            !browse.hide_subfolders,
         )
         .await?
         .into_iter()
@@ -763,15 +961,17 @@ struct Desktop {
     add_tags_draft: Option<AddTagsDraft>,
     delete_folder: Option<Uuid>,
     open_folders: OpenSet<Uuid>,
+    collapsed_sections: HashSet<Uuid>,
     folder_draft: Option<FolderDraft>,
     rows: Vec<Row>,
     positions: HashMap<Uuid, usize>,
+    asset_grid: AssetGrid,
     status: Option<Status>,
     announcement: Option<String>,
     previews: Previews,
     viewer: Viewer,
     restore_grid_focus: bool,
-    selection: Selection<Uuid>,
+    selection: Selection<GridEntry>,
     display: DisplayMode,
     zoom: f64,
     zoom_limit: f64,
@@ -827,9 +1027,11 @@ impl Desktop {
             add_tags_draft: None,
             delete_folder: None,
             open_folders: OpenSet::new(),
+            collapsed_sections: HashSet::new(),
             folder_draft: None,
             rows: Vec::new(),
             positions: HashMap::new(),
+            asset_grid: AssetGrid::default(),
             status: None,
             announcement: None,
             previews,
@@ -929,6 +1131,7 @@ impl Desktop {
                 self.add_tags_draft = None;
                 self.delete_folder = None;
                 self.open_folders = OpenSet::new();
+                self.collapsed_sections.clear();
                 self.folder_draft = None;
                 self.replace_rows(rows);
                 self.announcement = Some(Word::plain("Library open").english.to_owned());
@@ -937,6 +1140,9 @@ impl Desktop {
             Ok(Update::Found(browse, rows)) => {
                 if self.browse.view != browse.view {
                     self.query.clone_from(&browse.query);
+                    if let Some(id) = browse.folder() {
+                        self.open_folder_ancestors(id);
+                    }
                     if self.viewer.asset().is_some() {
                         self.viewer.close();
                         self.restore_grid_focus = true;
@@ -955,6 +1161,7 @@ impl Desktop {
                 self.browse = Browse {
                     view: AssetView::Folder(id),
                     query: String::new(),
+                    hide_subfolders: false,
                     ..self.browse.clone()
                 };
                 self.query.clear();
@@ -1136,33 +1343,35 @@ impl Desktop {
             .enumerate()
             .map(|(at, row)| (row.asset.id, at))
             .collect();
+        self.rows = rows;
+        self.refresh_grid();
+    }
+
+    fn refresh_grid(&mut self) {
+        let asset_grid = AssetGrid::prepare(
+            &self.rows,
+            &self.browse,
+            &self.folders,
+            &self.organization,
+            &self.collapsed_sections,
+        );
         if self
             .viewer
             .asset()
-            .is_some_and(|id| !self.positions.contains_key(&id))
+            .is_some_and(|id| !asset_grid.visible_positions.contains_key(&id))
         {
             self.viewer.close();
             self.restore_grid_focus = true;
         }
-        self.selection
-            .items
-            .retain(|id| self.positions.contains_key(id));
-        self.selection.lead = self
-            .selection
-            .lead
-            .filter(|id| self.positions.contains_key(id));
-        self.selection.anchor = self
-            .selection
-            .anchor
-            .filter(|id| self.positions.contains_key(id));
+        asset_grid.retain_selection(&mut self.selection);
         if self
             .notes_draft
             .as_ref()
-            .is_some_and(|(id, _)| self.selection.items.as_slice() != [*id])
+            .is_some_and(|(id, _)| unique_assets(&self.selection.items).as_slice() != [*id])
         {
             self.notes_draft = None;
         }
-        self.rows = rows;
+        self.asset_grid = asset_grid;
     }
 
     fn open_picker(&mut self) {
@@ -1243,7 +1452,7 @@ impl Desktop {
         for event in out.events {
             if let CollectionEvent::Activate(view) = event {
                 if let Some(view) = view {
-                    self.navigate_to(view);
+                    self.navigate_to(view, ui.ctx());
                 } else if self.idle() {
                     self.open_tag_manager();
                 }
@@ -1283,11 +1492,13 @@ impl Desktop {
         self.organization.counts.get(view).copied().unwrap_or(0)
     }
 
-    fn navigate_to(&mut self, view: AssetView) {
-        if self.idle()
-            && self.browse.view != view
-            && let Some(library) = &self.library
-        {
+    fn navigate_to(&mut self, view: AssetView, ctx: &Context) {
+        if !self.idle() {
+            return;
+        }
+        if self.browse.view == view {
+            self.viewer_action(ViewerAction::Back, ctx);
+        } else if let Some(library) = &self.library {
             self.folder_draft = None;
             self.submit(
                 Operation::Find(
@@ -1304,8 +1515,8 @@ impl Desktop {
                             self.browse.order
                         },
                         view,
-                        include_subfolders: false,
                         query: String::new(),
+                        hide_subfolders: false,
                         ..self.browse.clone()
                     },
                 ),
@@ -1314,20 +1525,23 @@ impl Desktop {
         }
     }
 
+    fn open_folder_ancestors(&mut self, id: Uuid) {
+        let mut current = id;
+        while let Some(ancestor) = self
+            .folders
+            .iter()
+            .find(|folder| folder.id == current)
+            .and_then(|folder| folder.parent)
+        {
+            self.open_folders.set(&ancestor, true);
+            current = ancestor;
+        }
+    }
+
     fn start_folder(&mut self, parent: Option<Uuid>) {
         if let Some(parent) = parent {
             self.open_folders.set(&parent, true);
-            // A selected descendant can outlive the collapse of one of its ancestors.
-            let mut current = parent;
-            while let Some(ancestor) = self
-                .folders
-                .iter()
-                .find(|folder| folder.id == current)
-                .and_then(|folder| folder.parent)
-            {
-                self.open_folders.set(&ancestor, true);
-                current = ancestor;
-            }
+            self.open_folder_ancestors(parent);
         }
         self.folder_draft = Some(FolderDraft {
             folder: Folder {
@@ -1363,6 +1577,7 @@ impl Desktop {
         let can_drop = idle && self.browse.view != AssetView::Trash;
         let mut list = List::new(Word::plain("Custom folders"))
             .tree(true)
+            .tree_leaves(TreeLeaves::Aligned)
             .natural_height(true)
             .takes_drop(DropKind::new::<DraggedAssets>(
                 DropPlace::Onto,
@@ -1524,7 +1739,7 @@ impl Desktop {
                     }
                 }
                 CollectionEvent::Activate(id) if id != DRAFT_FOLDER => {
-                    self.navigate_to(AssetView::Folder(id))
+                    self.navigate_to(AssetView::Folder(id), ui.ctx())
                 }
                 CollectionEvent::Open(change) => {
                     let groups = self
@@ -1706,7 +1921,7 @@ impl Desktop {
         let assets = self
             .viewer
             .asset()
-            .map_or_else(|| self.selection.items.clone(), |id| vec![id]);
+            .map_or_else(|| unique_assets(&self.selection.items), |id| vec![id]);
         if assets.len() != 1 {
             Text::new(Word::plain("Inspector"))
                 .role(TypeRole::BodyStrong)
@@ -1728,7 +1943,8 @@ impl Desktop {
             return;
         };
         let row = &self.rows[at];
-        if row.available {
+        let dedicated_viewer = row.asset.format.is_font() || row.asset.format.is_audio();
+        if row.available && !(dedicated_viewer && self.viewer.asset().is_some()) {
             self.inspector_preview(ui, &assets);
         }
         let gap = Env::of(ui).tokens.space.gap;
@@ -1737,7 +1953,26 @@ impl Desktop {
             .role(TypeRole::BodyStrong)
             .elide(Elide::Middle)
             .show(ui);
-        if !row.available {
+        if row.available && self.viewer.asset().is_none() {
+            let label = if row.asset.format.is_model() {
+                "Open 3D preview"
+            } else if row.asset.format.is_video() || row.asset.format.is_audio() {
+                "Open player"
+            } else if row.asset.format.is_font() {
+                "Open font specimen"
+            } else {
+                "Open preview"
+            };
+            if Button::new(Word::plain(label))
+                .size(ControlSize::Sm)
+                .enabled(self.idle())
+                .show(ui)
+                .clicked()
+            {
+                self.open_asset(at, ui.ctx());
+                return;
+            }
+        } else if !row.available {
             Text::new(Word::plain("Original unavailable"))
                 .tone(Tone::Warn)
                 .show(ui);
@@ -2286,8 +2521,8 @@ impl Desktop {
                         if let Some(action) = self.viewer.header(
                             ui,
                             &self.rows[at].asset.display_name,
-                            at,
-                            self.rows.len(),
+                            self.asset_grid.visible_positions[&self.rows[at].asset.id],
+                            self.asset_grid.visible_assets.len(),
                             writable,
                         ) {
                             self.viewer_action(action, ui.ctx());
@@ -2322,12 +2557,15 @@ impl Desktop {
     fn open_asset(&mut self, at: usize, ctx: &Context) {
         let Some(library) = &self.library else { return };
         let row = &self.rows[at];
+        let Some(&position) = self.asset_grid.visible_positions.get(&row.asset.id) else {
+            return;
+        };
         self.viewer.open(&row.asset, library.path.clone());
         self.announcement = Some(format!(
             "{} · {} / {}",
             row.asset.display_name,
-            at + 1,
-            self.rows.len()
+            position + 1,
+            self.asset_grid.visible_assets.len()
         ));
         ctx.request_repaint();
     }
@@ -2336,6 +2574,7 @@ impl Desktop {
         let Some(at) = self.viewed_position() else {
             return;
         };
+        let position = self.asset_grid.visible_positions[&self.rows[at].asset.id];
         let next = match action {
             ViewerAction::ToggleCommentTool => {
                 if self.can_write_comment() {
@@ -2363,11 +2602,13 @@ impl Desktop {
                 ctx.request_repaint();
                 return;
             }
-            ViewerAction::Previous => at.checked_sub(1),
-            ViewerAction::Next => (at + 1 < self.rows.len()).then_some(at + 1),
+            ViewerAction::Previous => position.checked_sub(1),
+            ViewerAction::Next => Some(position + 1),
         };
-        if let Some(next) = next {
-            self.open_asset(next, ctx);
+        if let Some(next) = next.and_then(|index| self.asset_grid.visible_assets.get(index))
+            && let Some(&at) = self.positions.get(next)
+        {
+            self.open_asset(at, ctx);
         }
     }
 
@@ -2549,12 +2790,32 @@ impl Desktop {
     fn browse_controls(&mut self, ui: &mut Ui) {
         let idle = self.idle();
         let rail = Env::of(ui).tokens.size.rail.width;
-        let width = ui.available_width();
+        let has_children = self.browse.folder().is_some_and(|parent| {
+            self.folders
+                .iter()
+                .any(|folder| folder.parent == Some(parent))
+        });
+        let toolbar_toggle = has_children && ui.available_width() >= rail * 2.0;
+        let width = ui.available_width() - if toolbar_toggle { rail } else { 0.0 };
         let combined = width < rail * 4.0;
         let search_width = width - if combined { rail } else { rail * 2.0 };
         let inline = search_width >= rail;
         let mut next = self.browse.clone();
+        let subfolders_label = if next.hide_subfolders {
+            "Show subfolders"
+        } else {
+            "Hide subfolders"
+        };
         let mut submitted = inline && self.search_field(ui, search_width, idle);
+        if toolbar_toggle
+            && chrome_icon("folder_open", subfolders_label)
+                .selected(!next.hide_subfolders)
+                .enabled(idle)
+                .show(ui)
+                .clicked()
+        {
+            next.hide_subfolders = !next.hide_subfolders;
+        }
         if !combined {
             let sort = chrome_icon("sort_ascending", "Sort")
                 .selected(next.order != AssetOrder::ViewDefault)
@@ -2576,6 +2837,12 @@ impl Desktop {
             .show(ui, |ui, _| {
                 if !inline {
                     submitted |= self.search_field(ui, rail * 4.0, idle);
+                    Divider::horizontal().show(ui);
+                }
+                if has_children && !toolbar_toggle {
+                    if MenuItem::new(Word::plain(subfolders_label)).show(ui).ran {
+                        next.hide_subfolders = !next.hide_subfolders;
+                    }
                     Divider::horizontal().show(ui);
                 }
                 filter_menu(ui, &mut next.filters, &self.organization.tags);
@@ -2625,12 +2892,12 @@ impl Desktop {
         .inner
     }
 
-    fn zoom_spec(&self) -> TileZoom {
-        TileZoom::bounded(0.6, self.zoom_limit, 0.25, 1.0)
+    fn zoom_spec(&self, scale: f64) -> TileZoom {
+        TileZoom::bounded(0.6 * scale, self.zoom_limit * scale, 0.25 * scale, scale)
     }
 
     fn zoom_controls(&mut self, ui: &mut Ui) {
-        let zoom = self.zoom_spec();
+        let zoom = self.zoom_spec(1.0);
         let range = zoom.range();
         let _ = ControlRow::new().show(ui, |ui, _| {
             if chrome_icon("grid", "Smaller thumbnails")
@@ -2666,7 +2933,7 @@ impl Desktop {
                     Text::new(format!(
                         "{} assets · {} selected",
                         self.rows.len(),
-                        self.selection.items.len()
+                        unique_assets(&self.selection.items).len()
                     ))
                     .role(TypeRole::Caption)
                     .shade(Shade::Muted)
@@ -3002,30 +3269,6 @@ impl Desktop {
             self.start_screen(ui);
             return;
         }
-        if let Some(parent) = self.browse.folder()
-            && self
-                .folders
-                .iter()
-                .any(|folder| folder.parent == Some(parent))
-        {
-            let mut include = self.browse.include_subfolders;
-            Checkbox::new(Bind::bound(&mut include))
-                .label(Word::plain("Include subfolders"))
-                .enabled(self.idle())
-                .show(ui);
-            if include != self.browse.include_subfolders
-                && let Some(library) = &self.library
-            {
-                let browse = Browse {
-                    include_subfolders: include,
-                    ..self.browse.clone()
-                };
-                self.submit(
-                    Operation::Find(library.path.clone(), browse),
-                    Word::plain("Opening view…"),
-                );
-            }
-        }
         let empty = if !self.browse.query.is_empty() || self.browse.filters != Filters::default() {
             "No matching files"
         } else {
@@ -3042,22 +3285,57 @@ impl Desktop {
         let source = Assets {
             rows: &self.rows,
             positions: &self.positions,
+            grid: &self.asset_grid,
             previews: &self.previews,
         };
-        let zoom = self.zoom_spec();
-        let at_maximum = self.zoom >= self.zoom_limit;
+        let justified = self.display == DisplayMode::Justified && self.zoom < self.zoom_limit;
+        let fit_sections = !justified && !source.grid.groups.is_empty();
+        let caption = if self.show_details {
+            CaptionPlace::Below
+        } else {
+            CaptionPlace::None
+        };
+        let pad = panel_padding(ui);
+        let env = Env::of(ui);
+        let inset = env.tokens.space.gap.inline;
+        // Sections already add this inset inside the grid.
+        let horizontal_pad = if fit_sections {
+            pad.saturating_sub(inset.round() as i8).max(0)
+        } else {
+            pad
+        };
+        let scale = if fit_sections {
+            let width = (ui.available_width() - 2.0 * (f32::from(horizontal_pad) + inset)).max(1.0);
+            let style = StyleCx::of_env(ui.ctx(), &env);
+            let surround = Tile::around_picture(&style, caption, self.show_details).width();
+            let gap = if self.show_details {
+                env.tokens.space.gap.stack
+            } else {
+                0.0
+            };
+            let thumb = env.tokens.size.thumb.card;
+            let card = self.zoom as f32 * thumb + surround;
+            let columns = ((width + gap) / (card + gap)).floor().max(1.0);
+            // The grouped arrangement counts columns again inside its insets.
+            // Leave a fraction of a point so rounding cannot drop the last column.
+            let side = ((width + gap) / columns - gap - surround - 0.01).max(1.0);
+            f64::from(side / thumb) / self.zoom
+        } else {
+            1.0
+        };
+        let zoom = self.zoom_spec(scale);
+        let shown_zoom = self.zoom * scale;
+        let mut grid_zoom = shown_zoom;
         let mut grid = TileGrid::new(Word::plain("Files"))
             .activate(ActivateOn::DoubleClick)
-            .drag_payload(|drag| Some(DraggedAssets(drag.keys.clone())))
+            .drag_payload(|drag| Some(DraggedAssets(unique_assets(&drag.keys))))
             .drag_preview(RowPreview::None)
             .empty(Word::plain(empty))
+            .groups(&self.asset_grid.groups)
+            .collapsible()
             .selection(Bind::bound(&mut self.selection))
-            .zoom(GridZoom::Bound(Bind::bound(&mut self.zoom), zoom))
-            .caption(if self.show_details {
-                CaptionPlace::Below
-            } else {
-                CaptionPlace::None
-            });
+            .zoom(GridZoom::Bound(Bind::bound(&mut grid_zoom), zoom))
+            .caption(caption);
         if !craft::ui::runtime::measure::active(ui.ctx())
             && std::mem::take(&mut self.restore_grid_focus)
         {
@@ -3066,17 +3344,20 @@ impl Desktop {
         if self.show_details {
             grid = grid.detail_line();
         }
-        grid = if self.display == DisplayMode::Justified && !at_maximum {
+        grid = if justified {
             grid.justified()
+        } else if fit_sections {
+            grid.aspect(4.0 / 3.0)
         } else {
             grid.aspect(4.0 / 3.0).fill_row()
         };
-        let pad = panel_padding(ui);
-        let opened = Frame::new()
-            .inner_margin(Margin::same(pad))
+        let (section, opened) = Frame::new()
+            .inner_margin(Margin::symmetric(horizontal_pad, pad))
             .show(ui, |ui| {
                 let shown = grid.show_items(ui, &source, &mut |key, _| {
-                    let row = &source.rows[source.positions[key]];
+                    let Some(row) = source.row(key) else {
+                        return Tile::new("");
+                    };
                     let path = &row.asset.path;
                     let size = self.previews.dimensions(path);
                     let mut tile = Tile::new(row.asset.display_name.clone());
@@ -3097,18 +3378,44 @@ impl Desktop {
                         self.previews.paint(cx, rect, path, PreviewSurface::Grid)
                     })
                 });
-                shown
+                let section = shown.events.into_iter().find_map(|event| match event {
+                    GridEvent::GroupPicked { group, .. } => {
+                        let group = source.grid.groups.get(group)?;
+                        Some((group.key, !group.open))
+                    }
+                    GridEvent::GroupOpen { group, open, .. } => {
+                        Some((source.grid.groups.get(group)?.key, open))
+                    }
+                    _ => None,
+                });
+                let opened = shown
                     .response
                     .events
                     .into_iter()
                     .find_map(|event| match event {
-                        CollectionEvent::Activate(id) => Some(id),
+                        CollectionEvent::Activate(key) => key.asset(),
                         _ => None,
-                    })
+                    });
+                (section, opened)
             })
             .inner;
-        if let Some(at) = opened.and_then(|id| self.positions.get(&id).copied())
-            && self.idle()
+        if grid_zoom != shown_zoom {
+            self.zoom = if grid_zoom >= self.zoom_limit * scale {
+                self.zoom_limit
+            } else {
+                (grid_zoom / scale).max(0.6)
+            };
+        }
+        if let Some((GridEntry::Folder(id), open)) = section {
+            if open {
+                self.collapsed_sections.remove(&id);
+            } else {
+                self.collapsed_sections.insert(id);
+            }
+            self.refresh_grid();
+            ui.ctx().request_repaint();
+        } else if self.idle()
+            && let Some(at) = opened.and_then(|id| self.positions.get(&id).copied())
         {
             self.open_asset(at, ui.ctx());
         }

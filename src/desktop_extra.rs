@@ -5,8 +5,10 @@ use craft::behavior::PixelSize;
 use craft::browse::thumbs::ThumbError;
 use craft::host::queue::Cancel;
 use craft::image_codecs::{Image, Limits};
+use craft::svg::tree::draw::tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use serde_json::Value as Json;
 
-use crate::desktop_documents::{StillPreview, embedded, failed, rgba, zip_preview};
+use crate::desktop_documents::{StillPreview, embedded, failed, rgba, straight_rgba, zip_preview};
 
 const INPUT_BYTES: usize = 64 << 20;
 
@@ -22,7 +24,7 @@ pub fn render(
         Format::Xcf => xcf(bytes, edge, cancel),
         Format::Gpl => palette(bytes, edge),
         Format::MaterialX => material(bytes, edge),
-        Format::Lottie | Format::DotLottie => lottie(bytes, format),
+        Format::Lottie | Format::DotLottie => lottie(bytes, format, edge, cancel),
         Format::Sketch => sketch(bytes, limits),
         Format::Aep | Format::Aepx => after_effects(bytes),
         Format::Ktx | Format::Ktx2 | Format::Basis => {
@@ -110,15 +112,33 @@ fn material(bytes: &[u8], edge: u32) -> Result<StillPreview, ThumbError> {
             preview.image = swatches(&[color], edge);
             preview.properties.retain(|(key, _)| *key != "Preview");
             preview.property("Preview", "Base-color swatch");
+        } else if let Some(path) = material
+            .inputs
+            .iter()
+            .find_map(|(name, value)| match value {
+                Value::Image(path) if name == "base_color" => Some(path),
+                _ => None,
+            })
+        {
+            preview.properties.retain(|(key, _)| *key != "Preview");
+            preview.property(
+                "Preview",
+                format!("Base color references the texture {path}"),
+            );
         }
     }
     Ok(preview)
 }
 
-fn lottie(bytes: &[u8], format: Format) -> Result<StillPreview, ThumbError> {
+fn lottie(
+    bytes: &[u8],
+    format: Format,
+    edge: u32,
+    cancel: &Cancel,
+) -> Result<StillPreview, ThumbError> {
     use craft::lottie::parse_document;
     if format == Format::Lottie {
-        return lottie_document(bytes, 1);
+        return lottie_document(bytes, 1, edge, cancel);
     }
     let mut archive = craft::zip::Archive::open(
         bytes,
@@ -151,7 +171,7 @@ fn lottie(bytes: &[u8], format: Format) -> Result<StillPreview, ThumbError> {
             .read(&format!("{directory}/{id}.json"), 8 << 20)
             .map_err(failed)?
         {
-            return lottie_document(&animation, entries.len());
+            return lottie_document(&animation, entries.len(), edge, cancel);
         }
     }
     // Keep the manifest's useful metadata even when an animation entry is missing.
@@ -160,7 +180,12 @@ fn lottie(bytes: &[u8], format: Format) -> Result<StillPreview, ThumbError> {
     Ok(preview)
 }
 
-fn lottie_document(bytes: &[u8], count: usize) -> Result<StillPreview, ThumbError> {
+fn lottie_document(
+    bytes: &[u8],
+    count: usize,
+    edge: u32,
+    cancel: &Cancel,
+) -> Result<StillPreview, ThumbError> {
     if bytes.len() > 8 << 20 {
         return Err(failed("Animation JSON exceeds the preview limit"));
     }
@@ -189,7 +214,212 @@ fn lottie_document(bytes: &[u8], count: usize) -> Result<StillPreview, ThumbErro
     if let Some(layers) = document.get("layers").and_then(serde_json::Value::as_array) {
         preview.property("Layers", layers.len().to_string());
     }
+    if let Some(image) = lottie_poster(&document, &header, edge, cancel)? {
+        preview.image = Ok(image);
+        preview.properties.retain(|(key, _)| *key != "Preview");
+        preview.property("Preview", "First frame · supported vector shapes");
+    }
     Ok(preview)
+}
+
+fn lottie_poster(
+    document: &Json,
+    header: &craft::lottie::Header<'_>,
+    edge: u32,
+    cancel: &Cancel,
+) -> Result<Option<Image>, ThumbError> {
+    let Some(layers) = document["layers"].as_array() else {
+        return Ok(None);
+    };
+    let scale = f64::from(edge) / header.width.max(header.height);
+    let width = (header.width * scale).round().max(1.0) as u32;
+    let height = (header.height * scale).round().max(1.0) as u32;
+    let mut pixmap =
+        Pixmap::new(width, height).ok_or_else(|| failed("Invalid animation canvas"))?;
+    let frame = header.in_point;
+    let mut budget = 2048usize;
+    for layer in layers.iter().rev().take(2048) {
+        if cancel.is_cancelled() {
+            return Err(ThumbError::Cancelled);
+        }
+        if layer["hd"] == true
+            || layer["ddd"].as_i64().is_some_and(|value| value != 0)
+            || layer.get("parent").is_some()
+            || layer["hasMask"] == true
+            || layer["tt"].as_i64().is_some_and(|value| value != 0)
+            || layer["ip"].as_f64().is_some_and(|start| frame < start)
+            || layer["op"].as_f64().is_some_and(|end| frame >= end)
+        {
+            continue;
+        }
+        if let Some(shapes) = layer["shapes"].as_array() {
+            let (pose, opacity) = lottie_pose(&layer["ks"], frame);
+            let transform = pose.post_scale(scale as f32, scale as f32);
+            lottie_shapes(
+                &mut pixmap,
+                shapes,
+                frame,
+                transform,
+                opacity,
+                0,
+                &mut budget,
+            );
+        }
+    }
+    if !pixmap.data().chunks_exact(4).any(|pixel| pixel[3] != 0) {
+        return Ok(None);
+    }
+    straight_rgba(width, height, pixmap.take()).map(Some)
+}
+
+fn lottie_value(value: &Json, frame: f64) -> Option<&Json> {
+    match craft::lottie::read_prop(value).value {
+        craft::lottie::PropValue::Static(value) => Some(value),
+        craft::lottie::PropValue::Keys(keys) => keys
+            .iter()
+            .rev()
+            .find(|key| key.t <= frame)
+            .or_else(|| keys.first())
+            .and_then(|key| key.s),
+        craft::lottie::PropValue::None => None,
+    }
+}
+
+fn lottie_scalar(value: &Json, frame: f64, fallback: f32) -> f32 {
+    lottie_value(value, frame)
+        .and_then(|value| value.as_f64().or_else(|| value[0].as_f64()))
+        .map_or(fallback, |value| value as f32)
+}
+
+fn lottie_pair(value: &Json, frame: f64, fallback: [f32; 2]) -> [f32; 2] {
+    lottie_value(value, frame).map_or(fallback, |value| {
+        [0, 1].map(|i| value[i].as_f64().map_or(fallback[i], |value| value as f32))
+    })
+}
+
+fn lottie_pose(pose: &Json, frame: f64) -> (Transform, f32) {
+    let [ax, ay] = lottie_pair(&pose["a"], frame, [0.0; 2]);
+    let [px, py] = lottie_pair(&pose["p"], frame, [0.0; 2]);
+    let [sx, sy] = lottie_pair(&pose["s"], frame, [100.0; 2]);
+    let rotation = lottie_scalar(&pose["r"], frame, 0.0);
+    let opacity = lottie_scalar(&pose["o"], frame, 100.0).clamp(0.0, 100.0) / 100.0;
+    (
+        Transform::from_translate(-ax, -ay)
+            .post_scale(sx / 100.0, sy / 100.0)
+            .post_rotate(rotation)
+            .post_translate(px, py),
+        opacity,
+    )
+}
+
+fn lottie_shapes(
+    pixmap: &mut Pixmap,
+    items: &[Json],
+    frame: f64,
+    transform: Transform,
+    opacity: f32,
+    depth: usize,
+    budget: &mut usize,
+) {
+    if depth >= 24 {
+        return;
+    }
+    let mut paths = Vec::new();
+    for item in items.iter().filter(|item| item["hd"] != true) {
+        let Some(left) = budget.checked_sub(1) else {
+            break;
+        };
+        *budget = left;
+        match item["ty"].as_str() {
+            Some(kind @ ("el" | "rc")) => {
+                let [x, y] = lottie_pair(&item["p"], frame, [0.0; 2]);
+                let [w, h] = lottie_pair(&item["s"], frame, [0.0; 2]);
+                if let Some(rect) = Rect::from_xywh(x - w / 2.0, y - h / 2.0, w, h) {
+                    let mut path = PathBuilder::new();
+                    if kind == "el" {
+                        path.push_oval(rect);
+                    } else {
+                        path.push_rect(rect);
+                    }
+                    paths.extend(path.finish());
+                }
+            }
+            Some("fl") => {
+                let Some(rgb) = lottie_value(&item["c"], frame) else {
+                    continue;
+                };
+                let Some(left) = budget.checked_sub(paths.len()) else {
+                    break;
+                };
+                *budget = left;
+                let [r, g, b] = [0, 1, 2].map(|i| {
+                    (rgb[i].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8
+                });
+                let alpha = lottie_scalar(&item["o"], frame, 100.0).clamp(0.0, 100.0) / 100.0;
+                let mut paint = Paint::default();
+                paint.set_color_rgba8(r, g, b, (alpha * opacity * 255.0).round() as u8);
+                let rule = if item["r"] == 2 {
+                    FillRule::EvenOdd
+                } else {
+                    FillRule::Winding
+                };
+                for path in &paths {
+                    pixmap.fill_path(path, &paint, rule, transform, None);
+                }
+            }
+            Some("sh") => {
+                if let Some(path) = lottie_value(&item["ks"], frame)
+                    .and_then(|value| craft::lottie::Bezier::from_json(value, false))
+                    && path.vertices.len() <= *budget
+                    && let Some(&[x, y]) = path.vertices.first()
+                {
+                    *budget -= path.vertices.len();
+                    let mut builder = PathBuilder::new();
+                    builder.move_to(x as f32, y as f32);
+                    let segments = path.vertices.len() - usize::from(!path.closed);
+                    for i in 0..segments {
+                        let next = (i + 1) % path.vertices.len();
+                        let [ax, ay] = path.vertices[i];
+                        let [bx, by] = path.vertices[next];
+                        let [ox, oy] = path.out_tangents[i];
+                        let [ix, iy] = path.in_tangents[next];
+                        builder.cubic_to(
+                            (ax + ox) as f32,
+                            (ay + oy) as f32,
+                            (bx + ix) as f32,
+                            (by + iy) as f32,
+                            bx as f32,
+                            by as f32,
+                        );
+                    }
+                    if path.closed {
+                        builder.close();
+                    }
+                    paths.extend(builder.finish());
+                }
+            }
+            Some("gr") => {
+                if let Some(children) = item["it"].as_array() {
+                    let (pose, alpha) = children
+                        .iter()
+                        .find(|child| child["ty"] == "tr")
+                        .map_or((Transform::identity(), 1.0), |child| {
+                            lottie_pose(child, frame)
+                        });
+                    lottie_shapes(
+                        pixmap,
+                        children,
+                        frame,
+                        pose.post_concat(transform),
+                        opacity * alpha,
+                        depth + 1,
+                        budget,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn sketch(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {

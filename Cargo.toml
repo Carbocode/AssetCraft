@@ -1,6 +1,6 @@
 [package]
 name = "assetcraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -34,7 +34,7 @@ desktop = [
     "craft/media-avi", "craft/media-mxf", "craft/media-mpegts",
     "craft/video-hevc-decode", "craft/video-av1-decode", "craft/video-vp8-decode",
     "craft/video-dnx", "craft/video-mjpeg", "craft/video-mpeg2-decode",
-    "dep:basisu", "dep:ktx2",
+    "dep:basisu", "dep:ktx2", "dep:harfrust", "dep:skrifa", "dep:wuff",
 ]
 
 [dependencies]
@@ -45,12 +45,15 @@ craft = { git = "https://github.com/storytold/craft-libs.git", rev = "90e14375a4
 eframe = { version = "=0.37.0", optional = true, default-features = false, features = ["accesskit"] }
 flate2 = { version = "=1.1.11", optional = true, default-features = false }
 futures-executor = "=0.3.32"
+harfrust = { version = "=0.13.3", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "=1.0.154", optional = true }
 sha2 = "=0.10.9"
+skrifa = { version = "=0.47.0", optional = true }
 sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite-bundled", "sqlite-deserialize"] }
 tempfile = "=3.27.0"
 uuid = { version = "=1.27.0", default-features = false, features = ["v4"] }
+wuff = { version = "=0.2.10", optional = true, default-features = false, features = ["brotli"] }
 
 [[test]]
 name = "integration"

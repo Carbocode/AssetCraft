@@ -102,6 +102,67 @@ fn model(
     edge: u32,
     cancel: &Cancel,
 ) -> Result<StillPreview, ThumbError> {
+    let model = load_model(path, format, bytes, cancel)?;
+    let Model {
+        scene,
+        units,
+        axis,
+        z_up,
+        instances,
+    } = model;
+    let vertices: usize = scene.meshes.iter().map(|mesh| mesh.positions.len()).sum();
+    let triangles: usize = scene.meshes.iter().map(mesh::Mesh::triangle_count).sum();
+    let mut preview = StillPreview::new(Err(ThumbError::Unsupported));
+    for (name, count) in [
+        ("Meshes", scene.meshes.len()),
+        ("Vertices", vertices),
+        ("Triangles", triangles),
+        ("Instances", instances.len()),
+    ] {
+        preview.properties.push((name, count.to_string()));
+    }
+    if let Some(units) = units {
+        preview.properties.push(("Model units", units));
+    }
+    if !scene.external.is_empty() {
+        preview
+            .properties
+            .push(("Linked resources", scene.external.len().to_string()));
+    }
+    if !scene.warnings.is_empty() {
+        preview
+            .properties
+            .push(("Model warnings", scene.warnings.join(" · ")));
+    }
+    preview.image = match project_scene(&scene, &instances, z_up, &axis, cancel) {
+        Ok(mut geometry) => {
+            if let Some([x, y, z]) = geometry.world.extent() {
+                preview
+                    .properties
+                    .push(("Model size", format!("{x:.4} × {y:.4} × {z:.4}")));
+            }
+            raster_model(&scene, &mut geometry, edge, cancel)
+        }
+        Err(error) => Err(error),
+    };
+    record_preview_error(&mut preview);
+    Ok(preview)
+}
+
+pub(crate) struct Model {
+    pub(crate) scene: Scene,
+    units: Option<String>,
+    pub(crate) axis: mesh::Mat4,
+    pub(crate) z_up: bool,
+    pub(crate) instances: Vec<(usize, mesh::Mat4)>,
+}
+
+pub(crate) fn load_model(
+    path: &Path,
+    format: Format,
+    bytes: &[u8],
+    cancel: &Cancel,
+) -> Result<Model, ThumbError> {
     let limits = Limits {
         max_vertices: MAX_VERTICES,
         max_triangles: MAX_TRIANGLES,
@@ -156,45 +217,15 @@ fn model(
     }
     .map_err(failed)?;
     cancellation(cancel)?;
-    let vertices: usize = scene.meshes.iter().map(|mesh| mesh.positions.len()).sum();
-    let triangles: usize = scene.meshes.iter().map(mesh::Mesh::triangle_count).sum();
     let instances = scene.instances(&limits).map_err(failed)?;
-    let mut preview = StillPreview::new(Err(ThumbError::Unsupported));
-    for (name, count) in [
-        ("Meshes", scene.meshes.len()),
-        ("Vertices", vertices),
-        ("Triangles", triangles),
-        ("Instances", instances.len()),
-    ] {
-        preview.properties.push((name, count.to_string()));
-    }
-    if let Some(units) = units {
-        preview.properties.push(("Model units", units));
-    }
-    if !scene.external.is_empty() {
-        preview
-            .properties
-            .push(("Linked resources", scene.external.len().to_string()));
-    }
-    if !scene.warnings.is_empty() {
-        preview
-            .properties
-            .push(("Model warnings", scene.warnings.join(" · ")));
-    }
     let z_up = matches!(format, Format::Stl | Format::Ply | Format::ThreeMf);
-    preview.image = match project_scene(&scene, &instances, z_up, &axis, cancel) {
-        Ok(mut geometry) => {
-            if let Some([x, y, z]) = geometry.world.extent() {
-                preview
-                    .properties
-                    .push(("Model size", format!("{x:.4} × {y:.4} × {z:.4}")));
-            }
-            raster_model(&scene, &mut geometry, edge, cancel)
-        }
-        Err(error) => Err(error),
-    };
-    record_preview_error(&mut preview);
-    Ok(preview)
+    Ok(Model {
+        scene,
+        units,
+        axis,
+        z_up,
+        instances,
+    })
 }
 
 fn usd_scene(
@@ -308,6 +339,9 @@ fn usd_scene(
             ..Default::default()
         });
     }
+    if meshes.is_empty() {
+        return Err(failed("This USD layer has no complete local static mesh"));
+    }
     let mut scene = Scene::from_meshes(meshes, Vec::new());
     scene.warnings = layer.warnings;
     if skipped != 0 {
@@ -406,33 +440,47 @@ fn project_scene(
     Ok(geometry)
 }
 
-struct Poster {
+pub(crate) struct Poster {
     edge: usize,
-    color: Vec<u8>,
+    pub(crate) color: Vec<u8>,
     depth: Vec<f64>,
     work_left: usize,
 }
 
 impl Poster {
-    fn new(edge: u32) -> Self {
+    pub(crate) fn new(edge: u32) -> Self {
+        Self::with_work_budget(edge, MAX_DRAW_WORK, [0; 4])
+    }
+
+    pub(crate) fn with_work_budget(edge: u32, work_left: usize, background: [u8; 4]) -> Self {
         let edge = edge as usize;
         Self {
             edge,
-            color: [242, 246, 250, 255].repeat(edge * edge),
+            color: background.repeat(edge * edge),
             depth: vec![f64::NEG_INFINITY; edge * edge],
-            work_left: MAX_DRAW_WORK,
+            work_left,
         }
     }
 
-    fn pixel(&mut self, x: usize, y: usize, depth: f64, rgb: [u8; 3]) {
+    pub(crate) fn pixel(&mut self, x: usize, y: usize, depth: f64, rgb: [u8; 3]) {
         let i = y * self.edge + x;
         if self.depth[i] < depth {
             self.depth[i] = depth;
             self.color[i * 4..i * 4 + 3].copy_from_slice(&rgb);
+            self.color[i * 4 + 3] = 255;
         }
     }
 
-    fn triangle(&mut self, [a, b, c]: [[f64; 3]; 3], color: [u8; 3]) -> Result<(), ThumbError> {
+    pub(crate) fn covered(&self, x: usize, y: usize) -> bool {
+        self.depth[y * self.edge + x].is_finite()
+    }
+
+    pub(crate) fn triangle(
+        &mut self,
+        [a, b, c]: [[f64; 3]; 3],
+        color: impl FnOnce() -> [u8; 3],
+        wire: bool,
+    ) -> Result<(), ThumbError> {
         let signed_area = |a: [f64; 3], b: [f64; 3], x: f64, y: f64| {
             (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
         };
@@ -450,25 +498,44 @@ impl Poster {
                 .map(|p: [f64; 3]| p[axis])
                 .into_iter()
                 .fold(f64::NEG_INFINITY, f64::max);
-            (
-                low.floor().clamp(0.0, last) as usize,
-                high.ceil().clamp(0.0, last) as usize,
-            )
+            let start = (low - 0.5).ceil().max(0.0);
+            let end = (high - 0.5).floor().min(last);
+            (start <= end).then_some((start as usize, end as usize))
         };
-        let ((x0, x1), (y0, y1)) = (range(0), range(1));
+        let (Some((x0, x1)), Some((y0, y1))) = (range(0), range(1)) else {
+            return Ok(());
+        };
         self.work_left = self
             .work_left
             .checked_sub((x1 - x0 + 1) * (y1 - y0 + 1))
             .ok_or_else(|| failed("Model rasterization exceeds the preview work limit"))?;
+        let color = color();
+        let edge_thresholds = if wire {
+            [(b, c), (c, a), (a, b)]
+                .map(|(start, end)| (end[0] - start[0]).hypot(end[1] - start[1]) / area.abs())
+        } else {
+            [0.0; 3]
+        };
+        let step_u = (b[1] - c[1]) / area;
+        let step_v = (c[1] - a[1]) / area;
+        let first_x = x0 as f64 + 0.5;
         for y in y0..=y1 {
+            let py = y as f64 + 0.5;
+            let mut u = signed_area(b, c, first_x, py) / area;
+            let mut v = signed_area(c, a, first_x, py) / area;
             for x in x0..=x1 {
-                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
-                let u = signed_area(b, c, px, py) / area;
-                let v = signed_area(c, a, px, py) / area;
                 let w = 1.0 - u - v;
                 if u >= 0.0 && v >= 0.0 && w >= 0.0 {
-                    self.pixel(x, y, u * a[2] + v * b[2] + w * c[2], color);
+                    let outline = wire
+                        && [u, v, w]
+                            .into_iter()
+                            .zip(edge_thresholds)
+                            .any(|(weight, threshold)| weight <= threshold);
+                    let pixel = if outline { [32, 42, 55] } else { color };
+                    self.pixel(x, y, u * a[2] + v * b[2] + w * c[2], pixel);
                 }
+                u += step_u;
+                v += step_v;
             }
         }
         Ok(())
@@ -523,7 +590,7 @@ fn raster_model(
                     0.35 + 0.65 * (0.3 * normal[0] - 0.4 * normal[1] + 0.866 * normal[2]).abs();
                 let rgb = [base[0], base[1], base[2]]
                     .map(|value| craft::color::linear_to_srgb_u8(value * lighting as f32));
-                poster.triangle([*a, *b, *c], rgb)?;
+                poster.triangle([*a, *b, *c], || rgb, false)?;
             }
         }
     }

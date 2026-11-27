@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "assetcraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "basisu",
  "chrono",
@@ -301,13 +301,16 @@ dependencies = [
  "eframe",
  "flate2",
  "futures-executor",
+ "harfrust 0.13.3",
  "ktx2",
  "serde",
  "serde_json",
  "sha2",
+ "skrifa 0.47.0",
  "sqlx",
  "tempfile",
  "uuid",
+ "wuff",
 ]
 
 [[package]]

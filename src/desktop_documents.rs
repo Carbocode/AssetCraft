@@ -13,6 +13,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[path = "desktop_font_woff.rs"]
+pub(crate) mod woff;
+
 pub const VIEWER_EDGE: u32 = 2048;
 const PREVIEW_BYTES: usize = 64 << 20;
 const RENDER_BUDGET: u64 = 128 << 20;
@@ -50,6 +53,10 @@ pub fn render(
         Format::Eps => eps(&bytes, limits).unwrap_or_else(failed_preview),
         Format::Raw => raw(&bytes, limits, edge),
         Format::Ttf | Format::Otf | Format::Ttc => font(&bytes),
+        Format::Woff | Format::Woff2 => match woff::decode(&bytes) {
+            Some(sfnt) => font(&sfnt),
+            None => failed_preview(failed("Invalid or unsupported web font")),
+        },
         Format::Psd | Format::Psb => psd(bytes, limits, edge).unwrap_or_else(failed_preview),
         Format::Ora | Format::Kra | Format::Pcraft | Format::DesignCraft | Format::VectorCraft => {
             StillPreview::new(saved_image(format, &bytes, limits))
@@ -92,7 +99,73 @@ pub(crate) fn rgba(width: u32, height: u32, data: Vec<u8>) -> Result<Image, Thum
     Image::from_u8(width, height, ChannelLayout::Rgba, data).map_err(failed)
 }
 
-fn straight_rgba(width: u32, height: u32, mut data: Vec<u8>) -> Result<Image, ThumbError> {
+pub(crate) fn cineon_8bit(
+    bytes: &[u8],
+    limits: Limits,
+) -> Option<Result<Image, image_codecs::CodecError>> {
+    let word = |offset| {
+        Some(u32::from_be_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+    if word(0)? != 0x802a_5fd7 || bytes.get(198) != Some(&8) {
+        return None;
+    }
+    let &[interleave, packing, sign, sense] = bytes.get(680..684)? else {
+        return None;
+    };
+    if interleave != 0 || sign != 0 || sense != 0 {
+        return None;
+    }
+    let channels = *bytes.get(193)?;
+    let layout = match channels {
+        1 => ChannelLayout::Gray,
+        3 => ChannelLayout::Rgb,
+        _ => return None,
+    };
+    let (width, height) = (word(200)?, word(204)?);
+    for channel in 1..usize::from(channels) {
+        let relative = channel * 28;
+        if *bytes.get(198 + relative)? != 8
+            || word(200 + relative)? != width
+            || word(204 + relative)? != height
+        {
+            return None;
+        }
+    }
+    if let Err(error) = limits.check(width, height, layout, image_codecs::SampleType::U8) {
+        return Some(Err(error));
+    }
+    let offset = word(4)? as usize;
+    if offset < 692 {
+        return None;
+    }
+    let row = width as usize * usize::from(channels);
+    let stride = row.checked_add(word(684)? as usize)?;
+    let data_end = offset.checked_add(stride.checked_mul(height as usize)?)?;
+    // Some 8-bit writers retain packing 5 in the header but write tight RGB payloads.
+    let tail = word(688)? as usize;
+    let packed_bytes =
+        matches!(packing, 0..=2) || packing == 5 && data_end.checked_add(tail)? == bytes.len();
+    if !packed_bytes {
+        return None;
+    }
+    let data = bytes.get(offset..data_end)?;
+    let pixels = data
+        .chunks_exact(stride)
+        .flat_map(|line| line[..row].iter().copied())
+        .collect();
+    let orientation = *[1, 2, 4, 3, 5, 6, 8, 7].get(usize::from(bytes[192]))?;
+    Some(
+        Image::from_u8(width, height, layout, pixels).and_then(|image| image.oriented(orientation)),
+    )
+}
+
+pub(crate) fn straight_rgba(
+    width: u32,
+    height: u32,
+    mut data: Vec<u8>,
+) -> Result<Image, ThumbError> {
     for pixel in data.chunks_exact_mut(4) {
         let alpha = u32::from(pixel[3]);
         if (1..255).contains(&alpha) {
@@ -227,10 +300,16 @@ fn eps(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {
         )
         .map_err(failed)
     } else {
-        Err(ThumbError::Unsupported)
+        eps_rgb_image(sections.postscript, limits).ok_or(ThumbError::Unsupported)
     };
     let mut preview = StillPreview::new(image);
     let comments = craft::eps::Comments::read(sections.postscript);
+    if matches!(preview.image, Err(ThumbError::Unsupported)) {
+        preview.property(
+            "Preview",
+            "This EPS has no supported embedded preview or raster payload",
+        );
+    }
     if let Some([x0, y0, x1, y1]) = comments.hires_bounding_box.or(comments.bounding_box) {
         preview.property(
             "Bounding box",
@@ -238,6 +317,67 @@ fn eps(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {
         );
     }
     Ok(preview)
+}
+
+// Extract the uncompressed DirectClass RGB payload written by ImageMagick.
+// PostScript operators are never evaluated.
+fn eps_rgb_image(postscript: &[u8], limits: Limits) -> Option<Image> {
+    const IMAGE: &[u8] = b"\nDisplayImage\n";
+    let preamble = &postscript[..postscript.len().min(128 << 10)];
+    if !preamble
+        .split(|&byte| byte == b'\n')
+        .take(24)
+        .any(|line| line.trim_ascii() == b"%%Creator: (ImageMagick)")
+    {
+        return None;
+    }
+    let start = preamble
+        .windows(IMAGE.len())
+        .position(|part| part == IMAGE)?
+        + IMAGE.len();
+    let mut lines = postscript[start..].split(|&byte| byte == b'\n');
+    // Translation, scale and text size precede the raster dimensions.
+    let mut size = std::str::from_utf8(lines.nth(3)?)
+        .ok()?
+        .split_ascii_whitespace();
+    let width = size.next()?.parse::<u32>().ok()?;
+    let height = size.next()?.parse::<u32>().ok()?;
+    if size.next().is_some()
+        || lines.next()?.trim_ascii() != b"0"
+        || lines.next()?.trim_ascii() != b"0"
+    {
+        return None;
+    }
+    limits
+        .check(
+            width,
+            height,
+            ChannelLayout::Rgb,
+            image_codecs::SampleType::U8,
+        )
+        .ok()?;
+    let count = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(3)?;
+    if count > (postscript.len() - start) / 2 {
+        return None;
+    }
+    let mut encoded = lines
+        .take_while(|line| line.trim_ascii() != b"end")
+        .flatten()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace());
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(count).ok()?;
+    for _ in 0..count {
+        let high = char::from(encoded.next()?).to_digit(16)?;
+        let low = char::from(encoded.next()?).to_digit(16)?;
+        pixels.push((high * 16 + low) as u8);
+    }
+    if encoded.next().is_some() {
+        return None;
+    }
+    Image::from_u8(width, height, ChannelLayout::Rgb, pixels).ok()
 }
 
 fn raw(bytes: &[u8], limits: Limits, edge: u32) -> StillPreview {

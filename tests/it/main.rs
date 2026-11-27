@@ -616,6 +616,13 @@ fn model_and_drawing_previews_survive_a_version_eleven_catalog_upgrade() {
             .image
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let pixels = image.to_rgba8();
+        if format.is_model() {
+            assert_eq!(&pixels[..4], &[0; 4], "{name}");
+            assert!(
+                pixels.chunks_exact(4).any(|pixel| pixel[3] == 255),
+                "{name}"
+            );
+        }
         assert!(
             pixels.chunks_exact(4).any(|pixel| pixel != &pixels[..4]),
             "{name}"
@@ -1629,4 +1636,334 @@ fn adding_multiple_tags_preserves_existing_assignments_after_reopening() {
         );
         reopened.close().await.unwrap();
     });
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn video_playback_keeps_presentation_order_after_seeking_backwards() {
+    use craft::host::queue::Cancel;
+    use craft::media::isobmff::{
+        Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions,
+    };
+    use craft::video::prores::{ChromaFormat, Encoder, Frame, Profile};
+    use desktop_video::stream::Quality;
+    use std::io::Cursor;
+
+    let fixture = Fixture::new();
+    let width = 1600;
+    let mut encoder = Encoder::new(Profile::Standard, width, 32);
+    let mut frame = Frame::new(width, 32, ChromaFormat::Yuv422, 10, false).unwrap();
+    frame.cb.fill(512);
+    frame.cr.fill(512);
+    let mut movie =
+        Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+    let track = movie
+        .add_track(TrackConfig::new(
+            SampleEntry::prores(craft::media::isobmff::FourCc(*b"apcn"), width as u16, 32),
+            1000,
+        ))
+        .unwrap();
+    for (luminance, duration) in [(200, 40), (460, 80), (800, 30)] {
+        frame.y.fill(luminance);
+        movie
+            .write_sample(
+                track,
+                WriteSample {
+                    data: &encoder.encode(&frame).unwrap(),
+                    duration,
+                    composition_offset: 0,
+                    is_sync: true,
+                },
+            )
+            .unwrap();
+    }
+    fixture.write("timed.mov", &movie.finish().unwrap().into_inner());
+    let cancel = Cancel::new();
+    let mut stream =
+        desktop_video::stream::Video::open(&fixture.0.join("timed.mov"), Format::Mov, &cancel)
+            .unwrap();
+    let marks = stream.timeline();
+    assert_eq!(&*marks, &[0, 40_000_000, 120_000_000]);
+    assert!(stream.duration() > marks[2]);
+    assert!(!stream.has_audio());
+    let opening = stream
+        .frame(0, true, Quality::Still, &cancel)
+        .unwrap()
+        .unwrap();
+    let middle = stream
+        .frame(42_000_000, false, Quality::Playback, &cancel)
+        .unwrap()
+        .unwrap();
+    let last = stream
+        .frame(121_000_000, false, Quality::Playback, &cancel)
+        .unwrap()
+        .unwrap();
+    assert!(opening.ns < middle.ns && middle.ns < last.ns);
+    assert!(opening.image.dimensions().0 > last.image.dimensions().0);
+    let paused = stream
+        .frame(121_000_000, false, Quality::Still, &cancel)
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.ns, last.ns);
+    assert_eq!(paused.image.dimensions(), opening.image.dimensions());
+    assert!(opening.image.to_rgba8()[0] < middle.image.to_rgba8()[0]);
+    assert!(middle.image.to_rgba8()[0] < last.image.to_rgba8()[0]);
+    let returned = stream
+        .frame(30_000_000, true, Quality::Still, &cancel)
+        .unwrap()
+        .unwrap();
+    assert_eq!(returned.image.to_rgba8(), opening.image.to_rgba8());
+}
+
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_scene_render.rs"]
+mod desktop_scene_render;
+
+#[cfg(feature = "desktop")]
+#[test]
+fn cineon_preview_accepts_tight_eight_bit_rgb() {
+    use craft::image_codecs::Limits;
+
+    let mut bytes = vec![0; 1024];
+    bytes[..4].copy_from_slice(&0x802a_5fd7u32.to_be_bytes());
+    bytes[4..8].copy_from_slice(&1024u32.to_be_bytes());
+    bytes[193] = 3;
+    bytes[681] = 5;
+    for channel in 0..3 {
+        let at = channel * 28;
+        bytes[198 + at] = 8;
+        bytes[200 + at..204 + at].copy_from_slice(&2u32.to_be_bytes());
+        bytes[204 + at..208 + at].copy_from_slice(&1u32.to_be_bytes());
+    }
+    bytes.extend([255, 0, 0, 0, 128, 64]);
+    let image = desktop_documents::cineon_8bit(&bytes, Limits::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(image.to_rgba8(), [255, 0, 0, 255, 0, 128, 64, 255]);
+    bytes.pop();
+    assert!(desktop_documents::cineon_8bit(&bytes, Limits::default()).is_none());
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn lottie_poster_renders_vector_shapes_on_the_animation_canvas() {
+    use craft::host::queue::Cancel;
+    use craft::image_codecs::Limits;
+
+    let bytes = br#"{
+        "v":"5.7.4","w":80,"h":40,"fr":30,"ip":0,"op":60,
+        "layers":[{"ty":4,"ip":0,"op":60,"ks":{"p":{"a":1,"k":[{"t":0,"s":[40,20,0]}]}},
+            "shapes":[{"ty":"el","s":{"a":0,"k":[20,20]}},
+                      {"ty":"fl","c":{"a":0,"k":[0,1,0,1]}}]}]
+    }"#;
+    let preview =
+        desktop_extra::render(Format::Lottie, bytes, Limits::default(), 80, &Cancel::new());
+    let image = preview.image.unwrap();
+    assert_eq!(image.dimensions(), (80, 40));
+    let pixels = image.to_rgba8();
+    assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
+    let center = (20 * 80 + 40) * 4;
+    assert_eq!(&pixels[center..center + 4], &[0, 255, 0, 255]);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn eps_preview_reads_image_magick_rgb_without_interpreting_postscript() {
+    use craft::host::queue::Cancel;
+    use craft::image_codecs::Limits;
+
+    let bytes = b"%!PS-Adobe-3.0 EPSF-3.0\n%%Creator: (ImageMagick)\n%%BoundingBox: 0 0 2 1\nuserdict begin\nDisplayImage\n0 0\n2 1\n12\n2 1\n0\n0\nFF0000008000\n\nend\n%%EOF";
+    let preview = desktop_documents::render(
+        Format::Eps,
+        bytes.to_vec(),
+        Limits::default(),
+        64,
+        &Cancel::new(),
+    );
+    let image = preview.image.unwrap();
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(image.to_rgba8(), [255, 0, 0, 255, 0, 128, 0, 255]);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn orbit_reprojects_geometry_and_environment_lights_the_scene() {
+    use craft::host::queue::Cancel;
+    use desktop_scene_render::{Environment, Orbit, Quality, Scene, Studio};
+
+    let fixture = Fixture::new();
+    fixture.write(
+        "model.obj",
+        b"v 0 0 0\nv 2 0 0\nv 0 3 0\nv 0 0 1\nf 1 2 3\nf 1 4 2\nf 2 4 3\nf 1 3 4\n",
+    );
+    let cancel = Cancel::new();
+    let scene = Scene::open(&fixture.0.join("model.obj"), Format::Obj, &cancel).unwrap();
+    let view = Orbit {
+        grid: false,
+        show_environment: false,
+        ..Default::default()
+    };
+    let first = scene
+        .render(view, None, 96, Quality::Settled, &cancel)
+        .unwrap()
+        .to_rgba8();
+    let orbit = scene
+        .render(
+            Orbit {
+                azimuth: 135.0,
+                ..view
+            },
+            None,
+            96,
+            Quality::Settled,
+            &cancel,
+        )
+        .unwrap()
+        .to_rgba8();
+    assert_ne!(first, orbit);
+    let larger = scene
+        .render(view, None, 1024, Quality::Settled, &cancel)
+        .unwrap();
+    assert!(larger.dimensions().0 > 640);
+    assert!(
+        larger
+            .to_rgba8()
+            .chunks_exact(4)
+            .any(|pixel| pixel != [242, 246, 250, 255])
+    );
+
+    let data: Vec<_> = (0..32 * 16)
+        .flat_map(|i| {
+            if i % 32 < 12 {
+                [8.0f32, 0.3, 0.15]
+            } else {
+                [0.08, 0.3, 1.5]
+            }
+        })
+        .collect();
+    let environment = Image::from_normalized(
+        32,
+        16,
+        ChannelLayout::Rgb,
+        image_codecs::SampleType::F32,
+        &data,
+    )
+    .unwrap();
+    fixture.write(
+        "environment.hdr",
+        &image_codecs::encode(&environment, image_codecs::Format::Hdr, &Default::default())
+            .unwrap(),
+    );
+    let environment = Environment::open(&fixture.0.join("environment.hdr"), &cancel).unwrap();
+    let lit = scene
+        .render(view, Some(&environment), 96, Quality::Settled, &cancel)
+        .unwrap()
+        .to_rgba8();
+    let rotated = scene
+        .render(
+            Orbit {
+                environment_rotation: 90.0,
+                ..view
+            },
+            Some(&environment),
+            96,
+            Quality::Settled,
+            &cancel,
+        )
+        .unwrap()
+        .to_rgba8();
+    assert_ne!(lit, first);
+    assert_ne!(lit, rotated);
+
+    let dark = Orbit {
+        grid: true,
+        studio: Studio {
+            background: [22, 24, 28],
+            grid: [53, 56, 61],
+            axis: [105, 110, 119],
+        },
+        ..view
+    };
+    let image = scene
+        .render(dark, Some(&environment), 96, Quality::Settled, &cancel)
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(&image[..4], &[22, 24, 28, 255]);
+    assert!(
+        image
+            .chunks_exact(4)
+            .any(|pixel| pixel == [53, 56, 61, 255])
+    );
+    let panorama = scene
+        .render(
+            Orbit {
+                show_environment: true,
+                ..dark
+            },
+            Some(&environment),
+            96,
+            Quality::Settled,
+            &cancel,
+        )
+        .unwrap()
+        .to_rgba8();
+    assert_ne!(&panorama[..4], &image[..4]);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn perspective_scales_geometry_by_depth() {
+    use craft::host::queue::Cancel;
+    use desktop_scene_render::{Orbit, Projection, Quality, Scene};
+
+    let fixture = Fixture::new();
+    fixture.write(
+        "depth.obj",
+        b"v -2 -1 2\nv -1 -1 2\nv -1.5 1 2\nv 1 -1 -2\nv 2 -1 -2\nv 1.5 1 -2\nf 1 2 3\nf 4 5 6\n",
+    );
+    let cancel = Cancel::new();
+    let scene = Scene::open(&fixture.0.join("depth.obj"), Format::Obj, &cancel).unwrap();
+    let orthographic = Orbit {
+        projection: Projection::Orthographic,
+        azimuth: 0.0,
+        elevation: 0.0,
+        grid: false,
+        ..Orbit::default()
+    };
+    let perspective = Orbit {
+        azimuth: orthographic.azimuth,
+        elevation: orthographic.elevation,
+        grid: false,
+        ..Orbit::default()
+    };
+    const EDGE: u32 = 256;
+    let projected_areas = |view| {
+        let rgba = scene
+            .render(view, None, EDGE, Quality::Settled, &cancel)
+            .unwrap()
+            .to_rgba8();
+        let mut areas = [0usize; 2];
+        for (i, pixel) in rgba.chunks_exact(4).enumerate() {
+            if pixel != [242, 246, 250, 255] {
+                let x = i % EDGE as usize;
+                areas[usize::from(x >= EDGE as usize / 2)] += 1;
+            }
+        }
+        areas
+    };
+    let [near, far] = projected_areas(orthographic);
+    assert!(far > 0 && near.abs_diff(far) <= 1, "{near} vs {far}");
+    let [near, far] = projected_areas(perspective);
+    assert!(far > 0 && near * 2 > far * 3, "{near} vs {far}");
+    let quick = scene
+        .render(perspective, None, 96, Quality::Interactive, &cancel)
+        .unwrap()
+        .to_rgba8();
+    let settled = scene
+        .render(perspective, None, 96, Quality::Settled, &cancel)
+        .unwrap()
+        .to_rgba8();
+    let colors: std::collections::HashSet<_> = quick.chunks_exact(4).collect();
+    assert!(settled.chunks_exact(4).any(|pixel| !colors.contains(pixel)));
 }

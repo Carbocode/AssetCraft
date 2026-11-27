@@ -440,38 +440,10 @@ fn decode_keyframe(params: &CodecParams, bytes: &[u8], pts: i64) -> Result<Video
     } else {
         bytes
     };
-    let safe = match params.codec {
-        CodecId::ProRes => video::prores::probe(bytes)
-            .is_ok_and(|header| size_allowed(u32::from(header.width), u32::from(header.height))),
-        CodecId::Vp9 => video::vp9::decode::keyframe_info(bytes)
-            .is_some_and(|header| size_allowed(header.width, header.height)),
-        CodecId::H264 => check_avc(params, bytes),
-        CodecId::Hevc => check_hevc(params, bytes),
-        CodecId::Av1 => check_av1(params, bytes),
-        CodecId::Vp8 => video::vp8::keyframe_info(bytes)
-            .is_some_and(|header| size_allowed(header.width, header.height)),
-        CodecId::Dnxhd => video::dnx::probe(bytes).is_ok_and(|header| {
-            size_allowed(
-                header.width,
-                header
-                    .lines
-                    .saturating_mul(if header.frame_encoding { 1 } else { 2 }),
-            )
-        }),
-        CodecId::Mpeg2Video => video::mpeg2::probe(bytes)
-            .is_some_and(|header| size_allowed(header.width, header.height)),
-        CodecId::Mjpeg => video::mjpeg::is_packet(bytes),
-        _ => false,
-    };
-    if !safe {
+    if !playback_packet_safe(params, bytes, true) {
         return Err(ThumbError::Unsupported);
     }
-    let mut decoder = TrackDecoder::with_threads(params, 1).map_err(failed)?;
-    if params.codec == CodecId::Mjpeg {
-        decoder
-            .limit_mjpeg_allocation(MAX_PIXELS * 12)
-            .map_err(failed)?;
-    }
+    let mut decoder = playback_decoder(params, 1)?;
     if let Some(frame) = decoder
         .decode(bytes, pts)
         .map_err(failed)?
@@ -486,6 +458,53 @@ fn decode_keyframe(params: &CodecParams, bytes: &[u8], pts: i64) -> Result<Video
         .into_iter()
         .next()
         .ok_or(ThumbError::Unsupported)
+}
+
+fn playback_decoder(params: &CodecParams, threads: usize) -> Result<TrackDecoder, ThumbError> {
+    let mut decoder = TrackDecoder::with_threads(params, threads).map_err(failed)?;
+    if params.codec == CodecId::Mjpeg {
+        decoder
+            .limit_mjpeg_allocation(MAX_PIXELS * 12)
+            .map_err(failed)?;
+    }
+    Ok(decoder)
+}
+
+fn playback_packet_safe(params: &CodecParams, bytes: &[u8], keyframe: bool) -> bool {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_SAMPLE_BYTES || !supported(params.codec) {
+        return false;
+    }
+    match params.codec {
+        CodecId::ProRes => video::prores::probe(bytes)
+            .is_ok_and(|header| size_allowed(u32::from(header.width), u32::from(header.height))),
+        CodecId::Vp9 => {
+            !keyframe
+                || vp9_first_frame(bytes)
+                    .and_then(video::vp9::decode::keyframe_info)
+                    .is_some_and(|header| size_allowed(header.width, header.height))
+        }
+        CodecId::H264 => check_avc(params, bytes, keyframe),
+        CodecId::Hevc => check_hevc(params, bytes, keyframe),
+        CodecId::Av1 => check_av1(params, bytes, keyframe),
+        CodecId::Vp8 => {
+            (!keyframe && bytes[0] & 1 == 1)
+                || video::vp8::keyframe_info(bytes)
+                    .is_some_and(|header| size_allowed(header.width, header.height))
+        }
+        CodecId::Dnxhd => video::dnx::probe(bytes).is_ok_and(|header| {
+            size_allowed(
+                header.width,
+                header
+                    .lines
+                    .saturating_mul(if header.frame_encoding { 1 } else { 2 }),
+            )
+        }),
+        CodecId::Mpeg2Video => video::mpeg2::probe(bytes).map_or(!keyframe, |header| {
+            size_allowed(header.width, header.height)
+        }),
+        CodecId::Mjpeg => video::mjpeg::is_packet(bytes),
+        _ => false,
+    }
 }
 
 fn vp9_first_frame(bytes: &[u8]) -> Option<&[u8]> {
@@ -507,7 +526,7 @@ fn vp9_first_frame(bytes: &[u8]) -> Option<&[u8]> {
     bytes[..start].get(..u32::from_le_bytes(size) as usize)
 }
 
-fn check_avc(params: &CodecParams, packet: &[u8]) -> bool {
+fn check_avc(params: &CodecParams, packet: &[u8], keyframe: bool) -> bool {
     use craft::media::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
     use craft::video::h264::decode::params::Sps;
     let config = isobmff::AvcConfig::parse(&params.extradata).ok();
@@ -534,7 +553,7 @@ fn check_avc(params: &CodecParams, packet: &[u8]) -> bool {
                 .filter(|nal| nal.first().is_some_and(|byte| byte & 31 == 7)),
         )
         .peekable();
-    parameter_sets.peek().is_some()
+    (!keyframe || parameter_sets.peek().is_some())
         && parameter_sets.all(|nal| {
             nal.get(1..).is_some_and(|bytes| {
                 Sps::parse(&unescape_rbsp(bytes)).is_ok_and(|sps| {
@@ -545,12 +564,14 @@ fn check_avc(params: &CodecParams, packet: &[u8]) -> bool {
                 })
             })
         })
-        && nals
-            .iter()
-            .any(|nal| nal.first().is_some_and(|byte| byte & 31 == 5))
+        && !nals.is_empty()
+        && (!keyframe
+            || nals
+                .iter()
+                .any(|nal| nal.first().is_some_and(|byte| byte & 31 == 5)))
 }
 
-fn check_hevc(params: &CodecParams, packet: &[u8]) -> bool {
+fn check_hevc(params: &CodecParams, packet: &[u8], keyframe: bool) -> bool {
     use craft::media::bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
     use craft::video::hevc::decode::params::Sps;
     let config = isobmff::HevcConfig::parse(&params.extradata).ok();
@@ -571,7 +592,8 @@ fn check_hevc(params: &CodecParams, packet: &[u8]) -> bool {
         .chain(annexb_nals(&params.extradata).into_iter().filter(is_sps))
         .chain(nals.iter().copied().filter(is_sps))
         .peekable();
-    parameter_sets.peek().is_some()
+    !nals.is_empty()
+        && (!keyframe || parameter_sets.peek().is_some())
         && parameter_sets.all(|nal| {
             nal.get(2..).is_some_and(|bytes| {
                 Sps::parse(&unescape_rbsp(bytes))
@@ -580,7 +602,7 @@ fn check_hevc(params: &CodecParams, packet: &[u8]) -> bool {
         })
 }
 
-fn check_av1(params: &CodecParams, packet: &[u8]) -> bool {
+fn check_av1(params: &CodecParams, packet: &[u8], keyframe: bool) -> bool {
     let config = isobmff::Av1Config::parse(&params.extradata).ok();
     let config = config
         .as_ref()
@@ -611,7 +633,7 @@ fn check_av1(params: &CodecParams, packet: &[u8]) -> bool {
             data = remaining;
         }
     }
-    found
+    found || !keyframe
 }
 
 fn av1_obu_payload(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -706,3 +728,6 @@ fn poster(frame: &VideoFrame, rotation: u8, edge: u32) -> Result<Image, ThumbErr
     }
     Image::from_u8(out_w, out_h, ChannelLayout::Rgba, pixels).map_err(failed)
 }
+
+#[path = "desktop_video_stream.rs"]
+pub mod stream;

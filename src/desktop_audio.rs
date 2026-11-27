@@ -9,18 +9,16 @@ use craft::media::ReadSeekSource;
 
 use crate::desktop_documents::{StillPreview, failed};
 
+pub type Waveform = Vec<[f32; 2]>;
+
 pub fn render(file: File, format: Format, edge: u32, cancel: &Cancel) -> StillPreview {
-    let result = (|| {
-        if file.metadata().map_err(failed)?.len() > 64 << 20 {
-            if format == Format::Wav {
-                return large_wav(file, edge, cancel);
+    match inspect(file, format, edge, cancel) {
+        Ok((mut preview, peaks)) => {
+            if let Some(peaks) = peaks {
+                preview.image = waveform_image(&peaks);
             }
-            return Err(failed("Original exceeds the audio preview read limit"));
+            preview
         }
-        audio(file, format, edge, cancel)
-    })();
-    match result {
-        Ok(preview) => preview,
         Err(error) => {
             let mut preview = StillPreview::new(Err(error.clone()));
             if let ThumbError::Failed(reason) = error {
@@ -31,12 +29,27 @@ pub fn render(file: File, format: Format, edge: u32, cancel: &Cancel) -> StillPr
     }
 }
 
+pub fn inspect(
+    file: File,
+    format: Format,
+    edge: u32,
+    cancel: &Cancel,
+) -> Result<(StillPreview, Option<Waveform>), ThumbError> {
+    if file.metadata().map_err(failed)?.len() <= 64 << 20 {
+        audio(file, format, edge, cancel)
+    } else if format == Format::Wav {
+        large_wav(file, edge, cancel)
+    } else {
+        Err(failed("Original exceeds the audio preview read limit"))
+    }
+}
+
 fn audio(
     file: File,
     format: Format,
     edge: u32,
     cancel: &Cancel,
-) -> Result<StillPreview, ThumbError> {
+) -> Result<(StillPreview, Option<Waveform>), ThumbError> {
     let mut decoder =
         Decoder::open(file, Some(format.as_str()), &DecodeOptions::default()).map_err(failed)?;
     let info = decoder.info().clone();
@@ -52,7 +65,7 @@ fn audio(
     {
         preview.property("Description", &bwf.description);
     }
-    waveform(
+    let peaks = waveform(
         &mut preview,
         edge,
         known.then_some(info.frames),
@@ -64,14 +77,18 @@ fn audio(
             decoder.next_block().map_err(failed)
         },
     )?;
-    Ok(preview)
+    Ok((preview, peaks))
 }
 
-fn large_wav(file: File, edge: u32, cancel: &Cancel) -> Result<StillPreview, ThumbError> {
+fn large_wav(
+    file: File,
+    edge: u32,
+    cancel: &Cancel,
+) -> Result<(StillPreview, Option<Waveform>), ThumbError> {
     let source = ReadSeekSource::new(file).map_err(failed)?;
     let wav = WavRange::open(source, 64, 384_000).map_err(failed)?;
     let mut preview = audio_info("PCM", wav.rate, wav.channels, Some(wav.frames));
-    waveform(&mut preview, edge, Some(wav.frames), cancel, |frame| {
+    let peaks = waveform(&mut preview, edge, Some(wav.frames), cancel, |frame| {
         let count = wav.frames.saturating_sub(frame).min(4096);
         if count == 0 {
             return Ok(None);
@@ -85,7 +102,7 @@ fn large_wav(file: File, edge: u32, cancel: &Cancel) -> Result<StillPreview, Thu
         }
         Ok(Some(block))
     })?;
-    Ok(preview)
+    Ok((preview, peaks))
 }
 
 fn audio_info(codec: &str, rate: u32, channels: u16, frames: Option<u64>) -> StillPreview {
@@ -108,11 +125,9 @@ fn waveform(
     length: Option<u64>,
     cancel: &Cancel,
     mut sample_at: impl FnMut(u64) -> Result<Option<AudioBuffer>, ThumbError>,
-) -> Result<(), ThumbError> {
+) -> Result<Option<Waveform>, ThumbError> {
     let width = edge.clamp(64, 768);
-    let height = width / 3;
-    let mut rgba = [242, 246, 250, 255].repeat((width * height) as usize);
-    let centre = height / 2;
+    let mut peaks = vec![[0.0; 2]; width as usize];
     let span = length.unwrap_or(0);
     // Read at most a short block per strip when sampling a long track.
     let strips = if length.is_some() { width.min(32) } else { 1 };
@@ -155,17 +170,10 @@ fn waveform(
                     high = high.max(sample);
                 }
             }
-            let row = |sample: f32| {
-                (centre as f32 - sample.clamp(-1.0, 1.0) * (centre - 2) as f32) as u32
-            };
-            for y in row(high)..=row(low) {
-                let offset = ((y * width + x) * 4) as usize;
-                rgba[offset..offset + 4].copy_from_slice(&[40, 93, 144, 255]);
-            }
+            peaks[x as usize] = [low.clamp(-1.0, 1.0), high.clamp(-1.0, 1.0)];
         }
     }
     if sampled {
-        preview.image = Image::from_u8(width, height, ChannelLayout::Rgba, rgba).map_err(failed);
         preview.property(
             "Waveform",
             if length.is_some() {
@@ -175,5 +183,20 @@ fn waveform(
             },
         );
     }
-    Ok(())
+    Ok(sampled.then_some(peaks))
+}
+
+fn waveform_image(peaks: &Waveform) -> Result<Image, ThumbError> {
+    let width = peaks.len();
+    let height = width / 3;
+    let mut rgba = [242, 246, 250, 255].repeat(width * height);
+    let centre = height / 2;
+    let row = |sample: f32| (centre as f32 - sample * (centre - 2) as f32) as usize;
+    for (x, &[low, high]) in peaks.iter().enumerate() {
+        for y in row(high)..=row(low) {
+            let offset = (y * width + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[40, 93, 144, 255]);
+        }
+    }
+    Image::from_u8(width as u32, height as u32, ChannelLayout::Rgba, rgba).map_err(failed)
 }

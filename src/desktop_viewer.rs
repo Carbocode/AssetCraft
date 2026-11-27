@@ -1,6 +1,9 @@
 use crate::{
     desktop_comments::{CommentChange, CommentEdit, PointComments},
+    desktop_player::Player,
+    desktop_scene_viewer::SceneViewer,
     desktop_thumbnails::decode_preview,
+    desktop_transport::Transport,
 };
 use assetcraft::{Asset, Catalog, Error, Format, PointComment};
 use craft::behavior::{
@@ -36,8 +39,12 @@ use craft::ui::runtime::overlay::{OpenFilter, any_open};
 use craft::ui::value_drag::{Slider, SliderScale};
 use futures_executor::block_on;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
+
+#[path = "desktop_font_viewer.rs"]
+mod desktop_font_viewer;
+use desktop_font_viewer::FontViewer;
 
 pub enum ViewerAction {
     Back,
@@ -126,7 +133,9 @@ impl DetailFrame {
 struct DetailImage {
     frames: Vec<DetailFrame>,
     index: usize,
-    next_frame: Option<Instant>,
+    transport: Transport,
+    timestamps: Vec<i64>,
+    duration_ns: i64,
     generation: u64,
     animation_error: Option<String>,
 }
@@ -136,24 +145,35 @@ impl DetailImage {
         &self.frames[self.index]
     }
 
-    fn toggle_playback(&mut self) {
-        self.next_frame = match self.next_frame {
-            Some(_) => None,
-            None => Some(Instant::now() + self.current().duration),
-        };
-    }
-
-    fn advance(&mut self, ui: &Ui) {
-        if let Some(mut deadline) = self.next_frame {
-            let now = Instant::now();
-            if now >= deadline {
-                self.index = (self.index + 1) % self.frames.len();
-                deadline = now + self.current().duration;
-                self.next_frame = Some(deadline);
-            }
-            ui.ctx()
-                .request_repaint_after(deadline.saturating_duration_since(now));
+    fn control_animation(&mut self, ui: &mut Ui) -> Option<Id> {
+        if self.frames.len() <= 1 {
+            return None;
         }
+        let real = !craft::ui::runtime::measure::active(ui.ctx());
+        if real {
+            self.transport.advance(ui, self.duration_ns);
+        }
+        let (input, slider) = self
+            .transport
+            .controls(ui, self.duration_ns, &self.timestamps);
+        if real {
+            if let Some(ns) = input.seek {
+                self.transport.pause();
+                self.transport.seek(ns);
+            } else if input.toggle {
+                if self.transport.playing() {
+                    self.transport.pause();
+                } else {
+                    self.transport.play(self.duration_ns);
+                }
+                ui.ctx().request_repaint();
+            }
+            self.index = self
+                .timestamps
+                .partition_point(|&ns| ns <= self.transport.position)
+                .saturating_sub(1);
+        }
+        Some(slider)
     }
 }
 
@@ -208,11 +228,13 @@ enum ImageState {
 
 struct OpenAsset {
     id: Uuid,
+    format: Format,
     catalog_path: PathBuf,
     state: ImageState,
     camera: CanvasView,
     hand: ViewerPan,
     slider_id: Option<Id>,
+    transport_slider: Option<Id>,
     focus_back: bool,
     jumped: bool,
     comments: PointComments,
@@ -222,6 +244,9 @@ struct OpenAsset {
 pub struct Viewer {
     open: Option<OpenAsset>,
     generation: u64,
+    scene: SceneViewer,
+    player: Player,
+    font: FontViewer,
     queue: JobQueue<u64, Result<DetailImage, ThumbError>>,
     comment_queue: JobQueue<u64, Result<Vec<PointComment>, Error>>,
 }
@@ -231,6 +256,9 @@ impl Viewer {
         Self {
             open: None,
             generation: 0,
+            scene: SceneViewer::new(host, wake.clone()),
+            player: Player::new(host, wake.clone()),
+            font: FontViewer::new(host, wake.clone()),
             queue: JobQueue::new(
                 host.jobs_shared().clone(),
                 wake.clone(),
@@ -263,7 +291,8 @@ impl Viewer {
         let generation = self.generation;
         self.open = Some(OpenAsset {
             id: asset.id,
-            catalog_path,
+            format: asset.format,
+            catalog_path: catalog_path.clone(),
             state: ImageState::Loading,
             camera: CanvasView::new(Rect::NOTHING, Point::ZERO, 1.0),
             hand: ViewerPan {
@@ -271,11 +300,24 @@ impl Viewer {
                 dragging: false,
             },
             slider_id: None,
+            transport_slider: None,
             focus_back,
             jumped: true,
             comments: PointComments::default(),
             comment_load_error: None,
         });
+        if asset.format.is_model() {
+            self.scene.open(asset, catalog_path);
+            return;
+        }
+        if asset.format.is_video() || asset.format.is_audio() {
+            self.player.open(asset);
+            return;
+        }
+        if asset.format.is_font() {
+            self.font.open(asset);
+            return;
+        }
         let path = asset.path.clone();
         self.queue
             .submit(generation, Priority::VISIBLE, move |cancel| {
@@ -300,10 +342,23 @@ impl Viewer {
                 if cancel.is_cancelled() {
                     return Err(ThumbError::Cancelled);
                 }
+                let mut duration_ns = 0;
+                let timestamps = frames
+                    .iter()
+                    .map(|frame| {
+                        let start = duration_ns;
+                        duration_ns += frame.duration.as_nanos() as i64;
+                        start
+                    })
+                    .collect();
+                let mut transport = Transport::default();
+                transport.looping = true;
                 Ok(DetailImage {
                     frames,
                     index: 0,
-                    next_frame: None,
+                    transport,
+                    timestamps,
+                    duration_ns,
                     generation,
                     animation_error,
                 })
@@ -312,6 +367,9 @@ impl Viewer {
 
     pub fn close(&mut self) {
         self.open = None;
+        self.scene.close();
+        self.player.close();
+        self.font.close();
         self.queue.reprioritize(|_, _| None);
         self.comment_queue.reprioritize(|_, _| None);
     }
@@ -367,7 +425,9 @@ impl Viewer {
     }
 
     pub fn receive(&mut self) -> Option<Word> {
-        let mut announcement = None;
+        let mut announcement = self.scene.receive();
+        announcement = self.player.receive().or(announcement);
+        announcement = self.font.receive().or(announcement);
         while let Some(finished) = self.queue.try_recv() {
             let Some(open) = self
                 .open
@@ -444,10 +504,16 @@ impl Viewer {
             }
             return Some(ViewerAction::Back);
         }
-        let slider_focused = open.slider_id.is_some_and(|id| focus::has(ctx, id));
+        let slider_focused = [open.slider_id, open.transport_slider]
+            .into_iter()
+            .flatten()
+            .any(|id| focus::has(ctx, id));
         if slider_focused
             || open.comments.editing()
             || open.comments.saving
+            || (open.format.is_font() && self.font.control_focused(ctx))
+            || (open.format.is_audio() && self.player.control_focused(ctx))
+            || (open.format.is_model() && self.scene.projection_focused(ctx))
             || focus::focused_rec(ctx).is_some_and(|focused| focused.stop.text)
         {
             return None;
@@ -481,35 +547,20 @@ impl Viewer {
         let open = self.open.as_mut()?;
         let browsing = !open.comments.editing() && !open.comments.saving;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if let ImageState::Ready(image) = &mut open.state
-                && image.frames.len() > 1
-            {
-                let label = if image.next_frame.is_some() {
-                    "Pause animation"
-                } else {
-                    "Play animation"
-                };
-                let playback = Button::new(Word::plain(label))
-                    .id(ui.make_persistent_id("animation-playback"))
-                    .variant(Variant::GHOST)
-                    .enabled(browsing)
-                    .show(ui);
-                if playback.clicked() {
-                    playback.response.request_focus();
-                    image.toggle_playback();
-                    ui.ctx().request_repaint();
-                }
-            }
             let tool_label = if open.comments.placing {
                 "Stop adding comments"
             } else {
                 "Add point comment"
             };
-            let comment_tool = crate::chrome_icon("note", tool_label)
-                .selected(open.comments.placing)
-                .enabled(browsing && writable && open.comments.available())
-                .show(ui)
-                .clicked();
+            let comment_tool = !open.format.is_model()
+                && !open.format.is_video()
+                && !open.format.is_audio()
+                && !open.format.is_font()
+                && crate::chrome_icon("note", tool_label)
+                    .selected(open.comments.placing)
+                    .enabled(browsing && writable && open.comments.available())
+                    .show(ui)
+                    .clicked();
             let next = crate::chrome_icon("chevron_right", "Next asset")
                 .enabled(browsing && position + 1 < count)
                 .show(ui)
@@ -534,10 +585,12 @@ impl Viewer {
                         back = back.request_focus(FocusRequest::Take);
                     }
                     let back = back.show(ui).clicked();
-                    Text::new(name.to_owned())
-                        .role(TypeRole::BodyStrong)
-                        .elide(Elide::Middle)
-                        .show(ui);
+                    if !open.format.is_audio() {
+                        Text::new(name.to_owned())
+                            .role(TypeRole::BodyStrong)
+                            .elide(Elide::Middle)
+                            .show(ui);
+                    }
                     back
                 })
                 .inner;
@@ -558,6 +611,18 @@ impl Viewer {
 
     pub fn body(&mut self, ui: &mut Ui, name: &str, writable: bool) -> Option<ViewerAction> {
         let open = self.open.as_mut()?;
+        if open.format.is_model() {
+            self.scene.show(ui, name);
+            return None;
+        }
+        if open.format.is_video() || open.format.is_audio() {
+            open.transport_slider = self.player.show(ui, name);
+            return None;
+        }
+        if open.format.is_font() {
+            self.font.show(ui);
+            return None;
+        }
         if let Some(error) = &open.comment_load_error {
             let notice = Notice::new(Tone::Bad, Word::plain("Could not load comments"))
                 .lines([error.clone()])
@@ -571,9 +636,7 @@ impl Viewer {
             Text::new(Word::plain("Loading comments…")).show(ui);
         }
         if let ImageState::Ready(image) = &mut open.state {
-            if !craft::ui::runtime::measure::active(ui.ctx()) {
-                image.advance(ui);
-            }
+            open.transport_slider = image.control_animation(ui);
             if let Some(error) = &image.animation_error {
                 Notice::new(Tone::Bad, Word::plain("Could not play animation"))
                     .lines([error.clone()])

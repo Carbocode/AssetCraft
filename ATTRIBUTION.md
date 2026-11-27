@@ -21,3 +21,7 @@ Audio preview uses Craft Audio and its unmodified Symphonia 0.6.1 fallback for f
 Texture preview uses the Apache-2.0 `ktx2` 0.5.0 and `basisu` 0.1.0 crates. Basis transcoding uses `ruzstd` 0.7.3 under MIT. USD decoding uses `lz4_flex` 0.11.7 under MIT. The notices are in `NOTICE`. [ktx2](https://crates.io/crates/ktx2/0.5.0) · [basisu](https://crates.io/crates/basisu/0.1.0) · [ruzstd](https://crates.io/crates/ruzstd/0.7.3) · [lz4_flex](https://crates.io/crates/lz4_flex/0.11.7)
 
 The extended-format integration test generates original palette, audio, animation, geometry and texture inputs. The fixtures are covered by this repository's Apache-2.0 licence.
+
+The interactive-viewer integration tests generate original ProRes luminance frames, an OBJ tetrahedron and an HDR light map. The fixtures are covered by this repository's Apache-2.0 licence.
+
+WOFF2 preview uses the MIT-licensed `wuff` 0.2.10 decoder that Craft also uses. Its licence and copyright notices are in `NOTICE`. [Exact upstream source](https://github.com/nicoburns/wuff/tree/0bb77cb3448100b8f560abf796014c8b85d75e23)

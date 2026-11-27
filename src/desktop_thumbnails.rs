@@ -166,8 +166,20 @@ pub fn decode_preview(path: &Path, cancel: &Cancel) -> Result<ImagePreview, Thum
         if cancel.is_cancelled() {
             return Err(ThumbError::Cancelled);
         }
+        let image = preview.image.map_err(|error| {
+            if matches!(error, ThumbError::Unsupported)
+                && let Some((_, reason)) = preview
+                    .properties
+                    .into_iter()
+                    .find(|(name, _)| *name == "Preview")
+            {
+                ThumbError::Failed(reason)
+            } else {
+                error
+            }
+        })?;
         return Ok(ImagePreview {
-            image: preview.image?,
+            image,
             animation: Ok(Vec::new()),
         });
     };
@@ -223,8 +235,24 @@ fn decode_image(
             limits: LIMITS,
             ..DecodeOptions::default()
         },
-    )
+    );
+    let image = if format == craft::image_codecs::Format::Cineon
+        && matches!(image, Err(CodecError::Unsupported { .. }))
+        && let Some(image) = desktop_documents::cineon_8bit(bytes, LIMITS)
+    {
+        image
+    } else {
+        image
+    }
     .map_err(|error| match error {
+        CodecError::Unsupported { .. }
+            if matches!(
+                format,
+                craft::image_codecs::Format::Cineon | craft::image_codecs::Format::JpegLs
+            ) =>
+        {
+            ThumbError::Failed(error.to_string())
+        }
         CodecError::UnknownFormat | CodecError::Unsupported { .. } => ThumbError::Unsupported,
         error => ThumbError::Failed(error.to_string()),
     })?;
