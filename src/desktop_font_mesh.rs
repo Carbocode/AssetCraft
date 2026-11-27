@@ -233,10 +233,11 @@ mod tests {
         let mesh = fill(&edges);
         let area = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|triangle| {
-                let points = [triangle[0], triangle[1], triangle[2]]
-                    .map(|index| mesh.vertices[index as usize].pos);
+                let points = triangle.map(|index| mesh.vertices[index as usize].pos);
                 let a = points[1] - points[0];
                 let b = points[2] - points[0];
                 (a.x * b.y - a.y * b.x).abs() / 2.0

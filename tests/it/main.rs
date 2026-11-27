@@ -154,7 +154,9 @@ fn extended_assets_keep_previews_after_migrating_a_version_twelve_catalog() {
     let waveform = wav.image.unwrap().to_rgba8();
     assert!(
         waveform
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel != &waveform[..4])
     );
     assert!(
@@ -424,8 +426,10 @@ fn vector_previews_render_the_document_size_and_first_pdf_page() {
     assert!(
         vector
             .to_rgba8()
-            .chunks_exact(4)
-            .all(|pixel| pixel == [255, 0, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [255, 0, 0, 255])
     );
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -619,12 +623,20 @@ fn model_and_drawing_previews_survive_a_version_eleven_catalog_upgrade() {
         if format.is_model() {
             assert_eq!(&pixels[..4], &[0; 4], "{name}");
             assert!(
-                pixels.chunks_exact(4).any(|pixel| pixel[3] == 255),
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] == 255),
                 "{name}"
             );
         }
         assert!(
-            pixels.chunks_exact(4).any(|pixel| pixel != &pixels[..4]),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel != &pixels[..4]),
             "{name}"
         );
     }
@@ -1829,8 +1841,10 @@ fn orbit_reprojects_geometry_and_environment_lights_the_scene() {
     assert!(
         larger
             .to_rgba8()
-            .chunks_exact(4)
-            .any(|pixel| pixel != [242, 246, 250, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| *pixel != [242, 246, 250, 255])
     );
 
     let data: Vec<_> = (0..32 * 16)
@@ -1890,11 +1904,7 @@ fn orbit_reprojects_geometry_and_environment_lights_the_scene() {
         .unwrap()
         .to_rgba8();
     assert_eq!(&image[..4], &[22, 24, 28, 255]);
-    assert!(
-        image
-            .chunks_exact(4)
-            .any(|pixel| pixel == [53, 56, 61, 255])
-    );
+    assert!(image.as_chunks::<4>().0.contains(&[53, 56, 61, 255]));
     let panorama = scene
         .render(
             Orbit {
@@ -1944,8 +1954,8 @@ fn perspective_scales_geometry_by_depth() {
             .unwrap()
             .to_rgba8();
         let mut areas = [0usize; 2];
-        for (i, pixel) in rgba.chunks_exact(4).enumerate() {
-            if pixel != [242, 246, 250, 255] {
+        for (i, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            if *pixel != [242, 246, 250, 255] {
                 let x = i % EDGE as usize;
                 areas[usize::from(x >= EDGE as usize / 2)] += 1;
             }
@@ -1964,6 +1974,12 @@ fn perspective_scales_geometry_by_depth() {
         .render(perspective, None, 96, Quality::Settled, &cancel)
         .unwrap()
         .to_rgba8();
-    let colors: std::collections::HashSet<_> = quick.chunks_exact(4).collect();
-    assert!(settled.chunks_exact(4).any(|pixel| !colors.contains(pixel)));
+    let colors: std::collections::HashSet<_> = quick.as_chunks::<4>().0.iter().collect();
+    assert!(
+        settled
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| !colors.contains(pixel))
+    );
 }

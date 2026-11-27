@@ -198,7 +198,11 @@ impl Drop for Sound {
 
 enum AudioReader {
     Decode(Box<Decoder<'static>>),
-    Wav(WavRange<ReadSeekSource<File>>, u64),
+    Wav {
+        wav: WavRange<ReadSeekSource<File>>,
+        #[cfg(target_os = "linux")]
+        at: u64,
+    },
 }
 
 impl AudioReader {
@@ -215,7 +219,11 @@ impl AudioReader {
             }
             let source = ReadSeekSource::new(file).map_err(|e| e.to_string())?;
             let wav = WavRange::open(source, 8, 192_000).map_err(|e| e.to_string())?;
-            return Ok(Self::Wav(wav, 0));
+            return Ok(Self::Wav {
+                wav,
+                #[cfg(target_os = "linux")]
+                at: 0,
+            });
         }
         Decoder::open(
             file,
@@ -236,7 +244,7 @@ impl AudioReader {
                     decoder.length_known().then_some(info.frames),
                 )
             }
-            Self::Wav(wav, _) => (wav.rate, wav.channels, Some(wav.frames)),
+            Self::Wav { wav, .. } => (wav.rate, wav.channels, Some(wav.frames)),
         }
     }
 
@@ -244,7 +252,7 @@ impl AudioReader {
     fn seek(&mut self, frame: u64) -> Result<(), String> {
         match self {
             Self::Decode(decoder) => decoder.seek(frame).map(|_| ()).map_err(|e| e.to_string()),
-            Self::Wav(wav, at) => {
+            Self::Wav { wav, at } => {
                 *at = frame.min(wav.frames);
                 Ok(())
             }
@@ -268,7 +276,7 @@ impl AudioReader {
                     }
                 }
             }
-            Self::Wav(wav, at) => {
+            Self::Wav { wav, at } => {
                 let count = wav.frames.saturating_sub(*at).min(2048);
                 if count == 0 {
                     return Ok(false);

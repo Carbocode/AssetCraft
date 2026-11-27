@@ -166,7 +166,7 @@ pub(crate) fn straight_rgba(
     height: u32,
     mut data: Vec<u8>,
 ) -> Result<Image, ThumbError> {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
         if (1..255).contains(&alpha) {
             for color in &mut pixel[..3] {

@@ -282,8 +282,10 @@ fn orient_rgba(
     if x {
         for scanline in data.chunks_exact_mut(row) {
             let (left, right) = scanline.split_at_mut(width as usize / 2 * 4);
-            for (a, b) in left.chunks_exact_mut(4).zip(right.rchunks_exact_mut(4)) {
-                a.swap_with_slice(b);
+            let (left, _) = left.as_chunks_mut::<4>();
+            let (right, _) = right.as_chunks_mut::<4>();
+            for (a, b) in left.iter_mut().zip(right.iter_mut().rev()) {
+                std::mem::swap(a, b);
             }
         }
     }

@@ -336,7 +336,7 @@ fn resolve(
         for pair in source.chunks_exact(stride * 2) {
             cancelled(cancel)?;
             let (top, bottom) = pair.split_at(stride);
-            for (top, bottom) in top.chunks_exact(8).zip(bottom.chunks_exact(8)) {
+            for (top, bottom) in top.as_chunks::<8>().0.iter().zip(bottom.as_chunks::<8>().0) {
                 let [r, g, b] = [0, 1, 2].map(|i| {
                     let sum = u16::from(top[i])
                         + u16::from(top[i + 4])

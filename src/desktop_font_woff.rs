@@ -50,7 +50,9 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut prior_tag = None;
     for (index, record) in data
         .get(44..woff_directory_end)?
-        .chunks_exact(20)
+        .as_chunks::<20>()
+        .0
+        .iter()
         .enumerate()
     {
         let tag = &record[..4];

@@ -266,7 +266,13 @@ fn lottie_poster(
             );
         }
     }
-    if !pixmap.data().chunks_exact(4).any(|pixel| pixel[3] != 0) {
+    if !pixmap
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[3] != 0)
+    {
         return Ok(None);
     }
     straight_rgba(width, height, pixmap.take()).map(Some)

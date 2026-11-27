@@ -328,7 +328,9 @@ fn usd_scene(
         meshes.push(mesh::Mesh {
             name: prim.name.clone(),
             positions: points
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|point| std::array::from_fn(|i| point[i] * scale[i] + offset[i]))
                 .collect(),
             parts: vec![mesh::Part {
