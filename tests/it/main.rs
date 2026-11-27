@@ -1658,7 +1658,7 @@ fn video_playback_keeps_presentation_order_after_seeking_backwards() {
         Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions,
     };
     use craft::video::prores::{ChromaFormat, Encoder, Frame, Profile};
-    use desktop_video::stream::Quality;
+    use desktop_video::stream::{FrameUpdate, Quality};
     use std::io::Cursor;
 
     let fixture = Fixture::new();
@@ -1697,34 +1697,37 @@ fn video_playback_keeps_presentation_order_after_seeking_backwards() {
     let marks = stream.timeline();
     assert_eq!(&*marks, &[0, 40_000_000, 120_000_000]);
     assert!(stream.duration() > marks[2]);
-    assert!(!stream.has_audio());
-    let opening = stream
-        .frame(0, true, Quality::Still, &cancel)
-        .unwrap()
-        .unwrap();
-    let middle = stream
-        .frame(42_000_000, false, Quality::Playback, &cancel)
-        .unwrap()
-        .unwrap();
-    let last = stream
-        .frame(121_000_000, false, Quality::Playback, &cancel)
-        .unwrap()
-        .unwrap();
-    assert!(opening.ns < middle.ns && middle.ns < last.ns);
-    assert!(opening.image.dimensions().0 > last.image.dimensions().0);
-    let paused = stream
-        .frame(121_000_000, false, Quality::Still, &cancel)
-        .unwrap()
-        .unwrap();
-    assert_eq!(paused.ns, last.ns);
-    assert_eq!(paused.image.dimensions(), opening.image.dimensions());
-    assert!(opening.image.to_rgba8()[0] < middle.image.to_rgba8()[0]);
-    assert!(middle.image.to_rgba8()[0] < last.image.to_rgba8()[0]);
-    let returned = stream
-        .frame(30_000_000, true, Quality::Still, &cancel)
-        .unwrap()
-        .unwrap();
-    assert_eq!(returned.image.to_rgba8(), opening.image.to_rgba8());
+    assert_eq!(stream.audio_offset(), None);
+    let ready = |update| match update {
+        FrameUpdate::Ready(Some(image)) => image,
+        _ => panic!("expected a newly decoded frame"),
+    };
+    let opening = ready(stream.frame(0, true, Quality::Still, &cancel).unwrap());
+    let middle = ready(
+        stream
+            .frame(42_000_000, false, Quality::Playback, &cancel)
+            .unwrap(),
+    );
+    let last = ready(
+        stream
+            .frame(121_000_000, false, Quality::Playback, &cancel)
+            .unwrap(),
+    );
+    assert!(opening.dimensions().0 > last.dimensions().0);
+    let paused = ready(
+        stream
+            .frame(121_000_000, false, Quality::Still, &cancel)
+            .unwrap(),
+    );
+    assert_eq!(paused.dimensions(), opening.dimensions());
+    assert!(opening.to_rgba8()[0] < middle.to_rgba8()[0]);
+    assert!(middle.to_rgba8()[0] < last.to_rgba8()[0]);
+    let returned = ready(
+        stream
+            .frame(30_000_000, true, Quality::Still, &cancel)
+            .unwrap(),
+    );
+    assert_eq!(returned.to_rgba8(), opening.to_rgba8());
 }
 
 #[cfg(feature = "desktop")]
@@ -1982,4 +1985,166 @@ fn perspective_scales_geometry_by_depth() {
             .iter()
             .any(|pixel| !colors.contains(pixel))
     );
+}
+
+#[cfg(feature = "desktop")]
+#[path = "../../src/desktop_movie_audio.rs"]
+mod desktop_movie_audio;
+
+#[cfg(feature = "desktop")]
+#[test]
+fn large_movie_keeps_its_audio_edit_and_can_seek_to_pcm() {
+    use craft::host::queue::Cancel;
+    use craft::media::isobmff::{
+        Brand, Edit, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample,
+        WriterOptions,
+    };
+    use craft::video::prores::{ChromaFormat, Encoder, Frame, Profile};
+
+    let fixture = Fixture::new();
+    let path = fixture.0.join("delayed.mov");
+    let mut movie = Mp4Writer::new(
+        std::io::Cursor::new(Vec::new()),
+        WriterOptions::new(Brand::Mov),
+    )
+    .unwrap();
+    let video = movie
+        .add_track(TrackConfig::new(
+            SampleEntry::prores(FourCc(*b"apcn"), 32, 32),
+            1000,
+        ))
+        .unwrap();
+    let mut sound = TrackConfig::new(
+        SampleEntry::pcm(PcmConfig {
+            bits: 16,
+            float: false,
+            big_endian: false,
+            signed: true,
+            channels: 1,
+            sample_rate: 8000.0,
+        }),
+        8000,
+    );
+    sound.edits = vec![
+        Edit {
+            segment_duration: 2000,
+            media_time: -1,
+            media_rate: 0x0001_0000,
+        },
+        Edit {
+            segment_duration: 2000,
+            media_time: 0,
+            media_rate: 0x0001_0000,
+        },
+    ];
+    let audio = movie.add_track(sound).unwrap();
+    let frame = Frame::new(32, 32, ChromaFormat::Yuv422, 10, false).unwrap();
+    let mut encoder = Encoder::new(Profile::Standard, 32, 32);
+    movie
+        .write_sample(
+            video,
+            WriteSample {
+                data: &encoder.encode(&frame).unwrap(),
+                duration: 4000,
+                composition_offset: 0,
+                is_sync: true,
+            },
+        )
+        .unwrap();
+    for sample in [8192i16, 16384i16] {
+        let pcm = sample.to_le_bytes().repeat(8000);
+        movie
+            .write_sample(
+                audio,
+                WriteSample {
+                    data: &pcm,
+                    duration: 8000,
+                    composition_offset: 0,
+                    is_sync: true,
+                },
+            )
+            .unwrap();
+    }
+    let mut bytes = movie.finish().unwrap().into_inner();
+    let padding = 130u32 << 20;
+    bytes.extend_from_slice(&padding.to_be_bytes());
+    bytes.extend_from_slice(b"free");
+    fixture.write("delayed.mov", &bytes);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(bytes.len() as u64 + u64::from(padding) - 8)
+        .unwrap();
+
+    let cancel = Cancel::new();
+    let video = desktop_video::stream::Video::open(&path, Format::Mov, &cancel).unwrap();
+    assert_eq!(video.audio_offset(), Some(2_000_000_000));
+    let mut audio = desktop_movie_audio::MovieAudio::open(file, &cancel).unwrap();
+    assert_eq!(audio.info(), (8000, 1, Some(16000)));
+    audio.seek(8000);
+    let mut values = Vec::new();
+    assert!(audio.read(&mut |sample| values.push(sample)).unwrap());
+    assert!(!values.is_empty());
+    assert!(values.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn video_seek_resumes_after_exhausting_its_packet_budget() {
+    use craft::host::queue::Cancel;
+    use craft::media::isobmff::{
+        Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions,
+    };
+    use craft::video::prores::{ChromaFormat, Encoder, Frame, Profile};
+    use desktop_video::stream::{FrameUpdate, Quality, Video};
+
+    let fixture = Fixture::new();
+    let mut movie = Mp4Writer::new(
+        std::io::Cursor::new(Vec::new()),
+        WriterOptions::new(Brand::Mov),
+    )
+    .unwrap();
+    let track = movie
+        .add_track(TrackConfig::new(
+            SampleEntry::prores(FourCc(*b"apcn"), 32, 32),
+            1000,
+        ))
+        .unwrap();
+    let mut frame = Frame::new(32, 32, ChromaFormat::Yuv422, 10, false).unwrap();
+    frame.cb.fill(512);
+    frame.cr.fill(512);
+    let mut encoder = Encoder::new(Profile::Standard, 32, 32);
+    frame.y.fill(200);
+    let dark = encoder.encode(&frame).unwrap();
+    frame.y.fill(800);
+    let light = encoder.encode(&frame).unwrap();
+    for i in 0..405 {
+        movie
+            .write_sample(
+                track,
+                WriteSample {
+                    data: if i < 400 { &dark } else { &light },
+                    duration: 20,
+                    composition_offset: 0,
+                    is_sync: i == 0,
+                },
+            )
+            .unwrap();
+    }
+    fixture.write("long-gop.mov", &movie.finish().unwrap().into_inner());
+    let cancel = Cancel::new();
+    let mut video = Video::open(&fixture.0.join("long-gop.mov"), Format::Mov, &cancel).unwrap();
+    let target = 8_000_000_000;
+    assert!(matches!(
+        video.frame(target, true, Quality::Still, &cancel).unwrap(),
+        FrameUpdate::Pending
+    ));
+    let FrameUpdate::Ready(Some(image)) =
+        video.frame(target, false, Quality::Still, &cancel).unwrap()
+    else {
+        panic!("seek did not resume at the previous decoder cursor");
+    };
+    assert!(image.to_rgba8()[0] > 150);
 }

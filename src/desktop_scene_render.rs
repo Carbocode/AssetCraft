@@ -111,13 +111,15 @@ impl Scene {
         let mut result = Self::default();
         let mut min = [f64::INFINITY; 3];
         let mut max = [f64::NEG_INFINITY; 3];
+        let mut triangles_left = TRIANGLE_BUDGET;
         for (index, matrix) in model.instances {
             cancelled(cancel)?;
             let geometry = &model.scene.meshes[index];
             let triangle_count = geometry.triangle_count();
-            if geometry.positions.len() > VERTEX_BUDGET.saturating_sub(result.points.len())
-                || triangle_count > TRIANGLE_BUDGET.saturating_sub(result.faces.len())
-            {
+            triangles_left = triangles_left
+                .checked_sub(triangle_count)
+                .ok_or_else(|| failed("Instanced geometry exceeds the 3D viewer budget"))?;
+            if geometry.positions.len() > VERTEX_BUDGET.saturating_sub(result.points.len()) {
                 return Err(failed("Instanced geometry exceeds the 3D viewer budget"));
             }
             result.points.reserve(geometry.positions.len());

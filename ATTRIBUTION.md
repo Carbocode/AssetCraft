@@ -25,3 +25,5 @@ The extended-format integration test generates original palette, audio, animatio
 The interactive-viewer integration tests generate original ProRes luminance frames, an OBJ tetrahedron and an HDR light map. The fixtures are covered by this repository's Apache-2.0 licence.
 
 WOFF2 preview uses the MIT-licensed `wuff` 0.2.10 decoder that Craft also uses. Its licence and copyright notices are in `NOTICE`. [Exact upstream source](https://github.com/nicoburns/wuff/tree/0bb77cb3448100b8f560abf796014c8b85d75e23)
+
+Model companion files use capability-relative opens from `cap-primitives` 4.0.3. AssetCraft uses the crate under MIT. [Published crate and licence files](https://docs.rs/crate/cap-primitives/4.0.3/source/)

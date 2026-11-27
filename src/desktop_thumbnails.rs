@@ -53,8 +53,15 @@ struct Original {
 impl ThumbDecoder for ImageDecoder {
     fn decode(&self, request: &DecodeRequest, cancel: &Cancel) -> Result<DecodedThumb, ThumbError> {
         let path = &request.key.path;
-        let source = read_asset_source(path, cancel)?;
+        let (source, opened_stat) = read_asset_source(path, cancel)?;
         let edge = request.side.clamp(1, desktop_documents::VIEWER_EDGE);
+        let stat = FileStat {
+            len: request.len,
+            modified: request.modified,
+        };
+        if opened_stat != stat {
+            return Err(ThumbError::Cancelled);
+        }
         let preview = match source {
             AssetSource::Media(file, format) => decode_media(file, format, edge, cancel),
             AssetSource::Image(bytes, format) => decode_still(path, bytes, format, edge, cancel),
@@ -62,10 +69,6 @@ impl ThumbDecoder for ImageDecoder {
         if cancel.is_cancelled() {
             return Err(ThumbError::Cancelled);
         }
-        let stat = FileStat {
-            len: request.len,
-            modified: request.modified,
-        };
         if let Ok(mut originals) = self.originals.lock()
             && let Some(original) = originals.get_mut(path)
             && original.stat == Some(stat)
@@ -151,7 +154,7 @@ fn decode_media(file: File, format: Format, edge: u32, cancel: &Cancel) -> Still
 }
 
 pub fn decode_preview(path: &Path, cancel: &Cancel) -> Result<ImagePreview, ThumbError> {
-    let (bytes, format) = match read_asset_source(path, cancel)? {
+    let (bytes, format) = match read_asset_source(path, cancel)?.0 {
         AssetSource::Media(file, format) => {
             let preview = decode_media(file, format, desktop_documents::VIEWER_EDGE, cancel);
             return Ok(ImagePreview {
@@ -199,7 +202,19 @@ pub fn decode_preview(path: &Path, cancel: &Cancel) -> Result<ImagePreview, Thum
                 Ok(Vec::new())
             }
         }),
-        Format::WebP if webp_is_animated(&bytes) => decode_webp_frames(&bytes, &options),
+        Format::WebP if webp_is_animated(&bytes) => {
+            let orientation =
+                craft::image_codecs::webp_probe::header(&bytes).map_or(1, |(_, _, value)| value);
+            decode_webp_frames(&bytes, &options).and_then(|frames| {
+                frames
+                    .into_iter()
+                    .map(|mut frame| {
+                        frame.image = frame.image.oriented(orientation)?;
+                        Ok(frame)
+                    })
+                    .collect()
+            })
+        }
         _ => Ok(Vec::new()),
     };
     if cancel.is_cancelled() {
@@ -315,7 +330,7 @@ enum AssetSource {
     Image(Vec<u8>, Format),
 }
 
-fn read_asset_source(path: &Path, cancel: &Cancel) -> Result<AssetSource, ThumbError> {
+fn read_asset_source(path: &Path, cancel: &Cancel) -> Result<(AssetSource, FileStat), ThumbError> {
     let file_error = |error: std::io::Error| {
         if error.kind() == ErrorKind::NotFound {
             ThumbError::Missing
@@ -328,6 +343,10 @@ fn read_asset_source(path: &Path, cancel: &Cancel) -> Result<AssetSource, ThumbE
     if !metadata.is_file() {
         return Err(ThumbError::Missing);
     }
+    let stat = FileStat {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    };
     let mut head = Vec::with_capacity(craft::sniff::HEAD);
     (&mut file)
         .take(craft::sniff::HEAD as u64)
@@ -340,7 +359,7 @@ fn read_asset_source(path: &Path, cancel: &Cancel) -> Result<AssetSource, ThumbE
         Format::detect(path, &head).filter(|format| format.is_video() || format.is_audio())
     {
         file.seek(SeekFrom::Start(0)).map_err(file_error)?;
-        return Ok(AssetSource::Media(file, format));
+        return Ok((AssetSource::Media(file, format), stat));
     }
     if metadata.len() > MAX_FILE_BYTES {
         return Err(ThumbError::Failed(
@@ -358,7 +377,7 @@ fn read_asset_source(path: &Path, cancel: &Cancel) -> Result<AssetSource, ThumbE
         return Err(ThumbError::Cancelled);
     }
     let format = Format::detect(path, &head).ok_or(ThumbError::Unsupported)?;
-    Ok(AssetSource::Image(head, format))
+    Ok((AssetSource::Image(head, format), stat))
 }
 
 #[derive(Clone, Copy)]

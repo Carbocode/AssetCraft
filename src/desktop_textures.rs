@@ -220,7 +220,15 @@ fn ktx2(bytes: &[u8]) -> Result<StillPreview, ThumbError> {
                 flip_y,
             },
         )
-    })();
+    })()
+    .and_then(|image| {
+        if reader.is_alpha_premultiplied() == Some(true) {
+            let (width, height) = image.dimensions();
+            crate::desktop_documents::straight_rgba(width, height, image.to_rgba8())
+        } else {
+            Ok(image)
+        }
+    });
     set_image(&mut preview, image);
     Ok(preview)
 }
@@ -292,30 +300,27 @@ fn orient_rgba(
     rgba(width, height, data)
 }
 
-fn gl_bc(format: u32) -> Option<(u32, usize)> {
+fn gl_bc(format: u32) -> Option<(u32, usize, bool)> {
     Some(match format {
-        0x83f0 | 0x83f1 | 0x8c4c | 0x8c4d => (71, 8),
-        0x83f2 | 0x8c4e => (74, 16),
-        0x83f3 | 0x8c4f => (77, 16),
-        0x8dbb => (80, 8),
-        0x8dbd => (83, 16),
-        0x8e8c | 0x8e8d => (98, 16),
+        0x83f0 | 0x8c4c => (71, 8, true),
+        0x83f1 | 0x8c4d => (71, 8, false),
+        0x83f2 | 0x8c4e => (74, 16, false),
+        0x83f3 | 0x8c4f => (77, 16, false),
+        0x8dbb => (80, 8, false),
+        0x8dbd => (83, 16, false),
         _ => return None,
     })
 }
 
-fn vk_bc(format: ktx2::Format) -> Option<(u32, usize)> {
+fn vk_bc(format: ktx2::Format) -> Option<(u32, usize, bool)> {
     use ktx2::Format as Vk;
     Some(match format {
-        Vk::BC1_RGB_UNORM_BLOCK
-        | Vk::BC1_RGB_SRGB_BLOCK
-        | Vk::BC1_RGBA_UNORM_BLOCK
-        | Vk::BC1_RGBA_SRGB_BLOCK => (71, 8),
-        Vk::BC2_UNORM_BLOCK | Vk::BC2_SRGB_BLOCK => (74, 16),
-        Vk::BC3_UNORM_BLOCK | Vk::BC3_SRGB_BLOCK => (77, 16),
-        Vk::BC4_UNORM_BLOCK => (80, 8),
-        Vk::BC5_UNORM_BLOCK => (83, 16),
-        Vk::BC7_UNORM_BLOCK | Vk::BC7_SRGB_BLOCK => (98, 16),
+        Vk::BC1_RGB_UNORM_BLOCK | Vk::BC1_RGB_SRGB_BLOCK => (71, 8, true),
+        Vk::BC1_RGBA_UNORM_BLOCK | Vk::BC1_RGBA_SRGB_BLOCK => (71, 8, false),
+        Vk::BC2_UNORM_BLOCK | Vk::BC2_SRGB_BLOCK => (74, 16, false),
+        Vk::BC3_UNORM_BLOCK | Vk::BC3_SRGB_BLOCK => (77, 16, false),
+        Vk::BC4_UNORM_BLOCK => (80, 8, false),
+        Vk::BC5_UNORM_BLOCK => (83, 16, false),
         _ => return None,
     })
 }
@@ -324,12 +329,12 @@ fn bc_image(
     width: u32,
     height: u32,
     pixels: &[u8],
-    encoding: Option<(u32, usize)>,
+    encoding: Option<(u32, usize, bool)>,
     x: bool,
     y: bool,
 ) -> Result<Image, ThumbError> {
     checked_pixels(width, height)?;
-    let (dxgi, block_bytes) = encoding.ok_or(ThumbError::Unsupported)?;
+    let (dxgi, block_bytes, opaque) = encoding.ok_or(ThumbError::Unsupported)?;
     let size = width.div_ceil(4) as usize * height.div_ceil(4) as usize * block_bytes;
     let data = pixels
         .get(..size)
@@ -360,5 +365,11 @@ fn bc_image(
         &Default::default(),
     )
     .map_err(failed)?;
-    orient_rgba(width, height, image.to_rgba8(), x, y)
+    let mut pixels = image.to_rgba8();
+    if opaque {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
+        }
+    }
+    orient_rgba(width, height, pixels, x, y)
 }

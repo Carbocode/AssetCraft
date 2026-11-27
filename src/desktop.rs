@@ -583,7 +583,7 @@ enum Update {
         Organization,
         Result<Vec<RecentLibrary>, craft::settings::SettingsError>,
     ),
-    Found(Browse, Vec<Row>),
+    Found(Browse, Vec<Row>, Vec<Folder>, Organization),
     FolderCreated(Uuid, Option<Uuid>, Vec<Folder>),
     FolderAppearanceChanged(Uuid, Appearance),
     LibraryAppearanceChanged(
@@ -643,9 +643,17 @@ impl Operation {
             }
             Self::Find(path, browse) => {
                 let mut catalog = Catalog::open(&path).await?;
-                let rows = lookup(&mut catalog, &browse).await?;
+                let (assets, folders, organization) = catalog
+                    .browse_snapshot(
+                        browse.view.clone(),
+                        &browse.query,
+                        browse.filters.tag.as_deref(),
+                        !browse.hide_subfolders,
+                    )
+                    .await?;
                 catalog.close().await?;
-                Ok(Update::Found(browse, rows))
+                let rows = browse_rows(assets, &browse);
+                Ok(Update::Found(browse, rows, folders, organization))
             }
             Self::CreateFolder(path, folder) => {
                 let mut catalog = Catalog::open(&path).await?;
@@ -775,14 +783,19 @@ async fn refresh(
 }
 
 async fn lookup(catalog: &mut Catalog, browse: &Browse) -> Result<Vec<Row>, Error> {
-    let mut rows: Vec<_> = catalog
+    let assets = catalog
         .find_filtered(
             browse.view.clone(),
             &browse.query,
             browse.filters.tag.as_deref(),
             !browse.hide_subfolders,
         )
-        .await?
+        .await?;
+    Ok(browse_rows(assets, browse))
+}
+
+fn browse_rows(assets: Vec<(Asset, AssetState)>, browse: &Browse) -> Vec<Row> {
+    let mut rows: Vec<_> = assets
         .into_iter()
         .filter(|(asset, _)| {
             browse
@@ -831,7 +844,7 @@ async fn lookup(catalog: &mut Catalog, browse: &Browse) -> Result<Vec<Row>, Erro
         }
         AssetOrder::Oldest => rows.sort_by_key(|row| row.asset.imported_at_unix_ms),
     }
-    Ok(rows)
+    rows
 }
 
 fn filter_menu(ui: &mut Ui, filters: &mut Filters, tags: &BTreeMap<String, u64>) {
@@ -1137,7 +1150,9 @@ impl Desktop {
                 self.announcement = Some(Word::plain("Library open").english.to_owned());
                 self.receive_recents(recents);
             }
-            Ok(Update::Found(browse, rows)) => {
+            Ok(Update::Found(browse, rows, folders, organization)) => {
+                self.folders = folders;
+                self.organization = organization;
                 if self.browse.view != browse.view {
                     self.query.clone_from(&browse.query);
                     if let Some(id) = browse.folder() {

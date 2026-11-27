@@ -1,9 +1,11 @@
 use std::{
+    fs::File,
     io::Read,
     path::{Component, Path},
 };
 
-use assetcraft::{Format, local_file};
+use assetcraft::Format;
+use cap_primitives::fs::{self, OpenOptions, OpenOptionsExt};
 use craft::behavior::kurbo::PathEl;
 use craft::browse::thumbs::ThumbError;
 use craft::host::queue::Cancel;
@@ -67,7 +69,7 @@ fn cancellation(cancel: &Cancel) -> Result<(), ThumbError> {
     }
 }
 
-fn sibling(root: &Path, name: &str, remaining: &mut usize, cancel: &Cancel) -> Option<Vec<u8>> {
+fn sibling(root: &File, name: &str, remaining: &mut usize, cancel: &Cancel) -> Option<Vec<u8>> {
     if cancel.is_cancelled() || name.contains([':', '\\', '\0']) {
         return None;
     }
@@ -78,11 +80,15 @@ fn sibling(root: &Path, name: &str, remaining: &mut usize, cancel: &Cancel) -> O
     {
         return None;
     }
-    let path = root.join(relative).canonicalize().ok()?;
-    if !path.starts_with(root) {
-        return None;
-    }
-    let file = local_file::open_read(&path).ok()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(0o4000);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(0x0004);
+    #[cfg(windows)]
+    options.share_mode(0x0000_0001);
+    let file = fs::open(root, relative, &options).ok()?;
     let stat = file.metadata().ok()?;
     if !stat.is_file() || stat.len() > *remaining as u64 {
         return None;
@@ -175,12 +181,14 @@ pub(crate) fn load_model(
         max_extras: 1024,
         ..Limits::default()
     };
-    let root = path.parent().and_then(|path| path.canonicalize().ok());
+    let root = path
+        .parent()
+        .and_then(|path| fs::open_ambient_dir(path, cap_primitives::ambient_authority()).ok());
     let mut bytes_left = MAX_DEPENDENCY_BYTES;
     let mut files_left = 64usize;
     let resolve = &mut |name: &str| {
         files_left = files_left.checked_sub(1)?;
-        sibling(root.as_deref()?, name, &mut bytes_left, cancel)
+        sibling(root.as_ref()?, name, &mut bytes_left, cancel)
     };
     let mut units = None;
     let mut axis = mesh::IDENTITY;

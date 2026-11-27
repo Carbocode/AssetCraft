@@ -3,8 +3,8 @@ use std::{collections::VecDeque, path::Path, sync::Arc};
 
 use super::{
     ByteSource, Cancel, CodecId, CodecParams, File, Format, Image, MAX_SAMPLE_BYTES,
-    ReadSeekSource, Source, ThumbError, TrackDecoder, VideoFrame, avi, check_movie_headers, failed,
-    isobmff, matroska, mpegts, mxf, playback_decoder, playback_packet_safe, poster, supported,
+    ReadSeekSource, Source, ThumbError, TrackDecoder, VideoFrame, avi, failed, isobmff, matroska,
+    mpegts, mxf, open_movie, playback_decoder, playback_packet_safe, poster, supported,
 };
 use assetcraft::local_file;
 
@@ -56,7 +56,7 @@ pub struct Video {
     timeline: Arc<[i64]>,
     sorted_keys: Vec<(i64, usize)>,
     duration: i64,
-    audio: bool,
+    audio_offset: Option<i64>,
     cursor: usize,
     decoder: Option<TrackDecoder>,
     entry: u32,
@@ -68,9 +68,9 @@ pub struct Video {
     drained: bool,
 }
 
-pub struct Frame {
-    pub image: Image,
-    pub ns: i64,
+pub enum FrameUpdate {
+    Pending,
+    Ready(Option<Box<Image>>),
 }
 
 impl Video {
@@ -87,10 +87,7 @@ impl Video {
         }
         let src = source(&file, cancel)?;
         let container = match format {
-            Format::Mp4 | Format::Mov => {
-                check_movie_headers(&src)?;
-                Container::Mp4(isobmff::open(&src).map_err(failed)?)
-            }
+            Format::Mp4 | Format::Mov => Container::Mp4(open_movie(&file, cancel)?),
             Format::WebM | Format::Mkv => {
                 let file = matroska::open_with(
                     &src,
@@ -163,7 +160,7 @@ impl Video {
         let duration = duration
             .unwrap_or(sample_end.max(last.saturating_add(DEFAULT_FRAME_NS)))
             .max(last.saturating_add(1));
-        let audio = container.has_native_audio();
+        let audio_offset = container.audio_offset();
         let params = container.params(track, samples[sorted_keys[0].1].entry);
         let large = params.width.unwrap_or(0).max(params.height.unwrap_or(0)) > STILL_EDGE;
         Ok(Self {
@@ -175,7 +172,7 @@ impl Video {
             timeline: timeline.into(),
             sorted_keys,
             duration,
-            audio,
+            audio_offset,
             cursor: 0,
             decoder: None,
             entry: 0,
@@ -194,8 +191,8 @@ impl Video {
     pub fn duration(&self) -> i64 {
         self.duration
     }
-    pub fn has_audio(&self) -> bool {
-        self.audio
+    pub fn audio_offset(&self) -> Option<i64> {
+        self.audio_offset
     }
 
     /// Decode to the frame being presented at `target`. Seeks rebuild codec state from a keyframe.
@@ -205,13 +202,17 @@ impl Video {
         seek: bool,
         quality: Quality,
         cancel: &Cancel,
-    ) -> Result<Option<Frame>, ThumbError> {
+    ) -> Result<FrameUpdate, ThumbError> {
         let target = target.clamp(self.timeline[0], self.duration.saturating_sub(1));
         let draft = self.large && quality == Quality::Playback;
         if seek
             || self.decoder.is_none()
             || self.draft != draft
-            || self.presented.is_some_and(|(at, _)| target < at)
+            || self
+                .current
+                .as_ref()
+                .and_then(|frame| frame.pts)
+                .is_some_and(|at| target < at)
         {
             let key = self
                 .sorted_keys
@@ -238,8 +239,11 @@ impl Video {
             {
                 self.current = self.ready.pop_front();
             }
-            if self.ready.front().is_some() || self.drained || batches == MAX_PACKETS_PER_UPDATE {
+            if !self.ready.is_empty() || self.drained {
                 break;
+            }
+            if batches == MAX_PACKETS_PER_UPDATE {
+                return Ok(FrameUpdate::Pending);
             }
             batches += 1;
             let frames = if let Some(sample) = self.samples.get(self.cursor).copied() {
@@ -286,11 +290,11 @@ impl Video {
             .ok_or_else(|| failed("No video frame at this position"))?;
         let ns = frame.pts.unwrap_or(target);
         if self.presented == Some((ns, quality)) {
-            return Ok(None);
+            return Ok(FrameUpdate::Ready(None));
         }
         let image = poster(frame, self.rotation, quality.edge())?;
         self.presented = Some((ns, quality));
-        Ok(Some(Frame { image, ns }))
+        Ok(FrameUpdate::Ready(Some(Box::new(image))))
     }
 }
 
@@ -324,20 +328,32 @@ impl Container {
         }
     }
 
-    fn has_native_audio(&self) -> bool {
-        let codec = match self {
-            Self::Mp4(file) => file
-                .track_of_kind(isobmff::TrackKind::Audio)
-                .map(|i| file.tracks[i].codec_params().codec),
-            Self::Mkv(file) => file
-                .track_of_kind(matroska::TrackKind::Audio)
-                .map(|i| file.tracks[i].codec_params().codec),
-            _ => None,
+    fn audio_offset(&self) -> Option<i64> {
+        let (codec, offset) = match self {
+            Self::Mp4(file) => {
+                let track = &file.tracks[file.track_of_kind(isobmff::TrackKind::Audio)?];
+                let offset = track
+                    .edits
+                    .iter()
+                    .take_while(|edit| edit.media_time < 0)
+                    .fold(0i64, |total, edit| {
+                        total.saturating_add(
+                            i64::try_from(edit.segment_duration).unwrap_or(i64::MAX),
+                        )
+                    });
+                (track.codec_params().codec, ticks_ns(offset, file.timescale))
+            }
+            Self::Mkv(file) => {
+                let track = &file.tracks[file.track_of_kind(matroska::TrackKind::Audio)?];
+                (track.codec_params().codec, 0)
+            }
+            _ => return None,
         };
         matches!(
             codec,
-            Some(CodecId::Aac | CodecId::Opus | CodecId::Alac | CodecId::Mp3 | CodecId::Pcm)
+            CodecId::Aac | CodecId::Opus | CodecId::Alac | CodecId::Mp3 | CodecId::Pcm
         )
+        .then_some(offset)
     }
 
     fn describe(&self, track: usize) -> Result<(Vec<Sample>, u8, Option<i64>), ThumbError> {

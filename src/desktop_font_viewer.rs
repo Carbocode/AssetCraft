@@ -78,6 +78,7 @@ struct Specimen {
     mesh: Mesh,
     bounds: OutlineBounds,
     missing: usize,
+    omitted: usize,
     pixels_per_point: f32,
 }
 
@@ -155,6 +156,25 @@ impl FontViewer {
     }
 
     pub(super) fn show(&mut self, ui: &mut Ui) {
+        let pad = f32::from(crate::panel_padding(ui));
+        let room = ui.available_rect_before_wrap().shrink(pad);
+        let minimum = if room.width() < 234.0 { 274.0 } else { 240.0 };
+        if matches!(self.state, Some(Ok(_))) && room.height() < minimum {
+            egui::ScrollArea::vertical()
+                .id_salt("compact-font-specimen")
+                .show(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), minimum + 2.0 * pad),
+                        egui::Sense::hover(),
+                    );
+                    in_room(ui, rect, |ui| self.show_specimen(ui));
+                });
+        } else {
+            self.show_specimen(ui);
+        }
+    }
+
+    fn show_specimen(&mut self, ui: &mut Ui) {
         let file = match &self.state {
             Some(Ok(file)) => file,
             Some(Err(error)) => {
@@ -587,6 +607,7 @@ impl Specimen {
         let mut cache = HashMap::new();
         let mut baseline = (f64::from(metrics.ascent) * scale).clamp(size * 0.6, size * 3.0);
         let mut missing = 0;
+        let mut omitted = 0;
         for line in text.split('\n').take(64) {
             let mut buffer = UnicodeBuffer::new();
             buffer.push_str(line);
@@ -602,8 +623,11 @@ impl Specimen {
                     (x + f64::from(pos.x_offset) * scale) as f32,
                     (baseline - f64::from(pos.y_offset) * scale) as f32,
                 );
-                if let Some(shape) = shape
-                    && mesh.vertices.len() + shape.vertices.len() <= 400_000
+                let over_limit = shape
+                    .as_ref()
+                    .is_ok_and(|shape| mesh.vertices.len() + shape.vertices.len() > 400_000);
+                if let Ok(shape) = shape
+                    && !over_limit
                 {
                     let points = shape.calc_bounds().translate(at);
                     if points.is_finite() {
@@ -623,8 +647,12 @@ impl Specimen {
                         }
                     }));
                 }
-                if glyph == 0 || shape.is_none() {
-                    missing += 1;
+                match shape {
+                    Err(font_mesh::GlyphError::Budget) => omitted += 1,
+                    Err(font_mesh::GlyphError::Unavailable) => missing += 1,
+                    Ok(_) if over_limit => omitted += 1,
+                    Ok(_) if glyph == 0 => missing += 1,
+                    Ok(_) => {}
                 }
                 x += f64::from(pos.x_advance) * scale;
             }
@@ -636,6 +664,7 @@ impl Specimen {
             mesh,
             bounds,
             missing,
+            omitted,
             pixels_per_point,
         })
     }
@@ -645,7 +674,7 @@ impl Specimen {
             Text::new(Word::plain("Enter sample text to preview it in this font.")).show(ui);
             return;
         }
-        if self.mesh.is_empty() {
+        if self.mesh.is_empty() && self.omitted == 0 {
             Text::new(Word::plain("No drawable outlines in this face")).show(ui);
             return;
         }
@@ -687,11 +716,19 @@ impl Specimen {
                     }
                 });
         });
-        if self.missing > 0 {
+        if self.missing > 0 || self.omitted > 0 {
+            let status_text = if self.omitted > 0 {
+                format!(
+                    "Preview incomplete · {} omitted · {} unavailable",
+                    self.omitted, self.missing
+                )
+            } else {
+                format!("{} glyphs unavailable in this face", self.missing)
+            };
             ui.painter().text(
                 egui::pos2(canvas.left() + 12.0, status + 10.0),
                 egui::Align2::LEFT_CENTER,
-                format!("{} glyphs unavailable in this face", self.missing),
+                status_text,
                 egui::FontId::proportional(12.0),
                 status_ink,
             );

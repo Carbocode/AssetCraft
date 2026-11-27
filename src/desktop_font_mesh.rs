@@ -38,10 +38,20 @@ impl Edge {
     }
 }
 
-pub(super) fn glyph(font: &FontOutline<'_>, id: u32, scale: f64, feather: f64) -> Option<Mesh> {
-    let mut path: BezPath = font.outline(id).ok()?;
+pub(super) enum GlyphError {
+    Unavailable,
+    Budget,
+}
+
+pub(super) fn glyph(
+    font: &FontOutline<'_>,
+    id: u32,
+    scale: f64,
+    feather: f64,
+) -> Result<Mesh, GlyphError> {
+    let mut path: BezPath = font.outline(id).map_err(|_| GlyphError::Unavailable)?;
     if path.elements().len() > 2048 {
-        return None;
+        return Err(GlyphError::Budget);
     }
     path.apply_affine(Affine::scale_non_uniform(scale, -scale));
     let mut contours: Vec<Vec<Point>> = Vec::new();
@@ -66,7 +76,7 @@ pub(super) fn glyph(font: &FontOutline<'_>, id: u32, scale: f64, feather: f64) -
         }
     });
     if points >= 1536 {
-        return None;
+        return Err(GlyphError::Budget);
     }
     for contour in &mut contours {
         if contour.len() > 1 && contour.first() == contour.last() {
@@ -84,7 +94,7 @@ pub(super) fn glyph(font: &FontOutline<'_>, id: u32, scale: f64, feather: f64) -
             feather_contour(&mut mesh, contour, &edges, feather);
         }
     }
-    Some(mesh)
+    Ok(mesh)
 }
 
 fn segments(points: &[Point]) -> impl Iterator<Item = (Point, Point)> + '_ {

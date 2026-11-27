@@ -147,7 +147,7 @@ fn waveform(
                 if let ThumbError::Failed(reason) = error {
                     preview.property("Preview", reason);
                 }
-                break;
+                return Ok(None);
             }
         };
         let frames = block.frames();

@@ -48,6 +48,7 @@ pub struct SceneViewer {
     quality: Quality,
     settle_until: f64,
     error: Option<String>,
+    frame_error: Option<String>,
 }
 
 impl SceneViewer {
@@ -79,6 +80,7 @@ impl SceneViewer {
             quality: Quality::Interactive,
             settle_until: 0.0,
             error: None,
+            frame_error: None,
         }
     }
 
@@ -134,6 +136,7 @@ impl SceneViewer {
         self.quality = Quality::Interactive;
         self.settle_until = 0.0;
         self.error = None;
+        self.frame_error = None;
     }
 
     pub fn projection_focused(&self, ctx: &Context) -> bool {
@@ -179,6 +182,7 @@ impl SceneViewer {
                     self.frame_job = None;
                     match result {
                         Ok(image) => {
+                            self.frame_error = None;
                             let (w, h) = image.dimensions();
                             self.pixels = Some(ColorImage::from_rgba_unmultiplied(
                                 [w as usize, h as usize],
@@ -188,7 +192,7 @@ impl SceneViewer {
                                 announcement = Some(Word::plain("3D preview ready"));
                             }
                         }
-                        Err(error) => self.error = Some(error_text(error)),
+                        Err(error) => self.frame_error = Some(error_text(error)),
                     }
                 }
                 _ => {}
@@ -212,6 +216,11 @@ impl SceneViewer {
         } else {
             self.environment = None;
             self.environment_path = None;
+            self.pixels = None;
+            if let Some(key) = self.frame_job.take() {
+                self.jobs
+                    .reprioritize(|job, priority| (*job != key).then_some(priority));
+            }
             self.dirty = true;
         }
     }
@@ -329,7 +338,7 @@ impl SceneViewer {
     }
 
     fn notice(&self, ui: &mut Ui) {
-        if let Some(error) = &self.error {
+        if let Some(error) = self.error.as_ref().or(self.frame_error.as_ref()) {
             Notice::new(Tone::Bad, Word::plain("3D preview"))
                 .lines([error.clone()])
                 .show(ui);

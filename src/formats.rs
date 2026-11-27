@@ -140,9 +140,12 @@ asset_formats! {
 }
 
 impl Format {
+    pub(crate) const LOTTIE_JSON_PROBE_BYTES: usize = 8 << 20;
+
     pub fn detect(path: &Path, bytes: &[u8]) -> Option<Self> {
         Self::document(path, bytes)
             .or_else(|| Self::additional(path, bytes))
+            .or_else(|| Self::lottie_json(path, bytes))
             .or_else(|| Self::video(bytes))
             .or_else(|| Self::model(path, bytes, bytes.len() as u64))
             .or_else(|| Self::from_prefix(path, bytes, image_codecs::detect(bytes)?))
@@ -275,15 +278,29 @@ impl Format {
                 return Some(Self::Aepx);
             }
         }
-        if text.starts_with('{')
-            && (named("json") || named("lottie"))
+        None
+    }
+
+    pub(crate) fn lottie_json(path: &Path, bytes: &[u8]) -> Option<Self> {
+        if !Self::lottie_name(path) {
+            return None;
+        }
+        let text =
+            String::from_utf8_lossy(&bytes[..bytes.len().min(Self::LOTTIE_JSON_PROBE_BYTES)]);
+        let text = text.trim_start_matches('\u{feff}').trim_start();
+        (text.starts_with('{')
             && ["\"layers\"", "\"fr\"", "\"ip\"", "\"op\"", "\"w\"", "\"h\""]
                 .into_iter()
-                .all(|key| text.contains(key))
-        {
-            return Some(Self::Lottie);
-        }
-        None
+                .all(|key| text.contains(key)))
+        .then_some(Self::Lottie)
+    }
+
+    pub(crate) fn lottie_name(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("lottie")
+            })
     }
 
     pub(crate) fn model(path: &Path, head: &[u8], len: u64) -> Option<Self> {

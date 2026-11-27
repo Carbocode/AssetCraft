@@ -172,6 +172,17 @@ fn mp4(src: &Source<'_>, edge: u32) -> Result<StillPreview, ThumbError> {
     Ok(preview)
 }
 
+pub(super) fn open_movie(file: &File, cancel: &Cancel) -> Result<isobmff::Mp4File, ThumbError> {
+    let source = Source {
+        stream: ReadSeekSource::new(file.try_clone().map_err(failed)?).map_err(failed)?,
+        bytes_left: Cell::new(128 << 20),
+        reads_left: Cell::new(300_000),
+        cancel,
+    };
+    check_movie_headers(&source)?;
+    isobmff::open(&source).map_err(failed)
+}
+
 fn check_movie_headers(src: &Source<'_>) -> Result<(), ThumbError> {
     use isobmff::boxes::BoxHeader;
     let mut offset = 0;
@@ -258,11 +269,16 @@ fn mkv(src: &Source<'_>, edge: u32) -> Result<StillPreview, ThumbError> {
     } else {
         None
     };
-    let mut preview = preview_info(
-        params.codec.name(),
-        (params.width.unwrap_or(0), params.height.unwrap_or(0)),
-        duration,
-    );
+    let rotation = track
+        .video
+        .as_ref()
+        .and_then(|video| video.display_rotation())
+        .unwrap_or(0);
+    let (mut width, mut height) = (params.width.unwrap_or(0), params.height.unwrap_or(0));
+    if !rotation.is_multiple_of(2) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let mut preview = preview_info(params.codec.name(), (width, height), duration);
     if !supported(params.codec) || !track.frames_readable() {
         no_frame(&mut preview, "No preview decoder for this video track");
         return Ok(preview);
@@ -280,7 +296,7 @@ fn mkv(src: &Source<'_>, edge: u32) -> Result<StillPreview, ThumbError> {
         .take(MAX_KEYFRAMES);
     for (sample_index, sample) in frames {
         let data = movie.read_sample(src, index, sample_index).map_err(failed);
-        if set_frame(&mut preview, &params, data, sample.pts, 0, edge) {
+        if set_frame(&mut preview, &params, data, sample.pts, rotation, edge) {
             return Ok(preview);
         }
     }

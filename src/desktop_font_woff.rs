@@ -14,6 +14,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
         if number(&header[8..12])? != data.len()
             || !(1..4096).contains(&count)
             || !(12..=MAX_FONT_BYTES).contains(&size)
+            || woff2_sizes(&data[48..], count).is_none()
         {
             return None;
         }
@@ -48,6 +49,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
     output[8..10].copy_from_slice(&exponent.to_be_bytes());
     output[10..12].copy_from_slice(&(count * 16 - search_range).to_be_bytes());
     let mut prior_tag = None;
+    let mut ranges = Vec::with_capacity(usize::from(count));
     for (index, record) in data
         .get(44..woff_directory_end)?
         .as_chunks::<20>()
@@ -71,7 +73,11 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
         }
         prior_tag = Some(tag);
 
-        let compressed = data.get(offset..offset.checked_add(compressed_len)?)?;
+        let end = offset.checked_add(compressed_len)?;
+        if end > offset {
+            ranges.push((offset, end));
+        }
+        let compressed = data.get(offset..end)?;
         if compressed_len == original_len {
             output.extend_from_slice(compressed);
         } else {
@@ -91,7 +97,52 @@ pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
         table[8..12].copy_from_slice(&(start as u32).to_be_bytes());
         table[12..16].copy_from_slice(&(original_len as u32).to_be_bytes());
     }
-    (output.len() == sfnt_len).then_some(output)
+    ranges.sort_unstable();
+    let overlap = ranges.windows(2).any(|pair| pair[0].1 > pair[1].0);
+    (output.len() == sfnt_len && !overlap).then_some(output)
+}
+
+fn woff2_sizes(mut directory: &[u8], count: u16) -> Option<()> {
+    let mut original_left = MAX_FONT_BYTES.checked_sub(12 + usize::from(count) * 16)?;
+    let mut transformed_left = MAX_FONT_BYTES;
+    for _ in 0..count {
+        let flags = *directory.split_off_first()?;
+        let index = flags & 0x3f;
+        let glyf_or_loca = match index {
+            10 | 11 => true,
+            63 => matches!(directory.split_off(..4)?, b"glyf" | b"loca"),
+            _ => false,
+        };
+        let transform = flags >> 6;
+        let original = base128(&mut directory)?;
+        let stored = if if glyf_or_loca {
+            transform != 3
+        } else {
+            transform != 0
+        } {
+            base128(&mut directory)?
+        } else {
+            original
+        };
+        original_left = original_left.checked_sub(original.checked_next_multiple_of(4)?)?;
+        transformed_left = transformed_left.checked_sub(stored)?;
+    }
+    Some(())
+}
+
+fn base128(bytes: &mut &[u8]) -> Option<usize> {
+    let mut value = 0u32;
+    for index in 0..5 {
+        let byte = *bytes.split_off_first()?;
+        if (index == 0 && byte == 0x80) || value > (u32::MAX >> 7) {
+            return None;
+        }
+        value = (value << 7) | u32::from(byte & 0x7f);
+        if byte < 0x80 {
+            return usize::try_from(value).ok();
+        }
+    }
+    None
 }
 
 fn number(bytes: &[u8]) -> Option<usize> {

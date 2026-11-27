@@ -151,7 +151,8 @@ impl DetailImage {
         }
         let real = !craft::ui::runtime::measure::active(ui.ctx());
         if real {
-            self.transport.advance(ui, self.duration_ns);
+            self.transport
+                .advance_at_frames(ui, self.duration_ns, &self.timestamps);
         }
         let (input, slider) = self
             .transport

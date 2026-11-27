@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use assetcraft::{Asset, Format, local_file};
@@ -32,7 +33,7 @@ use crate::{
     desktop_sound::{self, Sound},
     desktop_thumbnails::decode_preview,
     desktop_transport::Transport,
-    desktop_video::stream::{Frame, Quality, Video},
+    desktop_video::stream::{FrameUpdate, Quality, Video},
 };
 
 type Session = Arc<Mutex<Video>>;
@@ -41,17 +42,17 @@ struct Clip {
     session: Option<Session>,
     marks: Arc<[i64]>,
     duration: i64,
-    audio: bool,
+    audio_offset: Option<i64>,
     waveform: Option<Waveform>,
 }
 
 enum Update {
     Opened {
         clip: Option<Clip>,
-        frame: Option<Frame>,
+        frame: Option<Box<Image>>,
         error: Option<String>,
     },
-    Frame(Result<Option<Frame>, ThumbError>),
+    Frame(Result<FrameUpdate, ThumbError>),
 }
 
 pub struct Player {
@@ -120,8 +121,8 @@ impl Player {
         self.jobs.submit(key, Priority::VISIBLE, move |cancel| {
             let opened = (|| {
                 if format.is_audio() {
-                    let duration =
-                        desktop_sound::duration(&path, format).map_err(ThumbError::Failed)?;
+                    let duration = desktop_sound::duration(&path, format, cancel)
+                        .map_err(ThumbError::Failed)?;
                     let waveform = local_file::open_read(&path)
                         .ok()
                         .and_then(|file| desktop_audio::inspect(file, format, 768, cancel).ok())
@@ -130,7 +131,7 @@ impl Player {
                         Clip {
                             marks: Arc::from([]),
                             duration,
-                            audio: true,
+                            audio_offset: Some(0),
                             session: None,
                             waveform,
                         },
@@ -138,14 +139,18 @@ impl Player {
                     ));
                 }
                 let mut video = Video::open(&path, format, cancel)?;
-                let first = video
-                    .frame(0, true, Quality::Still, cancel)?
-                    .ok_or(ThumbError::Unsupported)?;
+                let first = loop {
+                    if let FrameUpdate::Ready(frame) =
+                        video.frame(0, false, Quality::Still, cancel)?
+                    {
+                        break frame.ok_or(ThumbError::Unsupported)?;
+                    }
+                };
                 Ok::<_, ThumbError>((
                     Clip {
                         marks: video.timeline(),
                         duration: video.duration(),
-                        audio: video.has_audio(),
+                        audio_offset: video.audio_offset(),
                         waveform: None,
                         session: Some(Arc::new(Mutex::new(video))),
                     },
@@ -162,10 +167,7 @@ impl Player {
                     let frame = (!format.is_audio() && !cancel.is_cancelled())
                         .then(|| decode_preview(&path, cancel).ok())
                         .flatten()
-                        .map(|preview| Frame {
-                            image: preview.image,
-                            ns: 0,
-                        });
+                        .map(|preview| Box::new(preview.image));
                     Update::Opened {
                         clip: None,
                         frame,
@@ -177,8 +179,22 @@ impl Player {
     }
 
     pub fn receive(&mut self) -> Option<Word> {
+        if let Some(start) = self.sound.receive_start()
+            && self.transport.waiting()
+        {
+            self.transport.begin(start);
+        }
         if let Some(error) = self.sound.receive_error() {
             self.audio_error = Some(error);
+            if self
+                .clip
+                .as_ref()
+                .is_some_and(|clip| clip.session.is_none())
+            {
+                self.transport.pause();
+            } else if self.transport.waiting() {
+                self.transport.begin(Instant::now());
+            }
         }
         let mut announcement = None;
         while let Some(job) = self.jobs.try_recv() {
@@ -192,7 +208,7 @@ impl Player {
                     self.clip = clip;
                     self.error = error;
                     if let Some(frame) = frame {
-                        self.set_pixels(frame.image);
+                        self.set_pixels(*frame);
                     }
                     announcement = Some(if self.clip.is_some() {
                         Word::plain("Player ready")
@@ -200,13 +216,9 @@ impl Player {
                         Word::plain("Playback unavailable")
                     });
                 }
-                Update::Frame(Ok(Some(frame))) => {
-                    if !self.transport.playing() {
-                        self.transport.position = frame.ns.max(0);
-                    }
-                    self.set_pixels(frame.image);
-                }
-                Update::Frame(Ok(None)) => {}
+                Update::Frame(Ok(FrameUpdate::Ready(Some(frame)))) => self.set_pixels(*frame),
+                Update::Frame(Ok(FrameUpdate::Ready(None))) => {}
+                Update::Frame(Ok(FrameUpdate::Pending)) => self.last_request = None,
                 Update::Frame(Err(error)) => {
                     self.error = Some(error_text(error));
                     self.transport.pause();
@@ -250,11 +262,13 @@ impl Player {
     fn sound_toggle(&mut self) {
         if self.transport.playing()
             && Sound::available()
-            && self.clip.as_ref().is_some_and(|clip| clip.audio)
+            && let Some(offset) = self.clip.as_ref().and_then(|clip| clip.audio_offset)
             && let Some((path, format)) = self.source.clone()
         {
             self.audio_error = None;
-            self.sound.start(path, format, self.transport.position);
+            self.transport.defer_start();
+            self.sound
+                .start(path, format, self.transport.position, offset);
         } else {
             self.sound.stop();
         }
@@ -294,6 +308,8 @@ impl Player {
                 self.error = None;
                 if self.transport.playing() {
                     self.transport.pause();
+                    self.stop_decode();
+                    self.last_request = None;
                 } else {
                     self.seek |= self.transport.position >= duration;
                     self.transport.play(duration);
@@ -330,15 +346,20 @@ impl Player {
                 });
             }
 
-            if self.clip.as_ref().is_some_and(|clip| clip.audio) {
+            if self
+                .clip
+                .as_ref()
+                .is_some_and(|clip| clip.audio_offset.is_some())
+            {
                 if Sound::available() {
                     let volume_label = format!("{:.0}%", self.volume * 100.0);
-                    Slider::new(Bind::bound(&mut self.volume), 0.0..=1.0)
+                    let output = Slider::new(Bind::bound(&mut self.volume), 0.0..=1.0)
                         .label(Word::plain("Volume"))
                         .value_text(volume_label)
                         .short(true)
                         .show(ui);
                     if real {
+                        self.volume_control = Some(output.response.id);
                         self.sound.set_volume(self.volume);
                     }
                 } else {
@@ -401,6 +422,9 @@ impl Player {
         let color = |value| Color32::from(Srgba::from(value));
         let room = ui.available_rect_before_wrap();
         if room.width() < 80.0 || room.height() < 120.0 {
+            if real && (wrapped || playing != self.transport.playing()) {
+                self.sound_toggle();
+            }
             return None;
         }
         let pad = env.tokens.space.pad.regular;

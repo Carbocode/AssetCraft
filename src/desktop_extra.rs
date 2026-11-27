@@ -5,10 +5,12 @@ use craft::behavior::PixelSize;
 use craft::browse::thumbs::ThumbError;
 use craft::host::queue::Cancel;
 use craft::image_codecs::{Image, Limits};
-use craft::svg::tree::draw::tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use craft::svg::tree::draw::tiny_skia::{
+    FillRule, Paint, Path as ShapePath, PathBuilder, Pixmap, Rect, Transform,
+};
 use serde_json::Value as Json;
 
-use crate::desktop_documents::{StillPreview, embedded, failed, rgba, straight_rgba, zip_preview};
+use crate::desktop_documents::{StillPreview, failed, rgba, straight_rgba, zip_preview};
 
 const INPUT_BYTES: usize = 64 << 20;
 
@@ -255,15 +257,25 @@ fn lottie_poster(
         if let Some(shapes) = layer["shapes"].as_array() {
             let (pose, opacity) = lottie_pose(&layer["ks"], frame);
             let transform = pose.post_scale(scale as f32, scale as f32);
+            let mut fills = Vec::new();
             lottie_shapes(
-                &mut pixmap,
                 shapes,
                 frame,
                 transform,
                 opacity,
                 0,
                 &mut budget,
+                &mut fills,
             );
+            for fill in fills.into_iter().rev() {
+                pixmap.fill_path(
+                    &fill.path,
+                    &fill.paint,
+                    fill.rule,
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
     }
     if !pixmap
@@ -318,19 +330,25 @@ fn lottie_pose(pose: &Json, frame: f64) -> (Transform, f32) {
     )
 }
 
+struct LottieFill {
+    path: ShapePath,
+    paint: Paint<'static>,
+    rule: FillRule,
+}
+
 fn lottie_shapes(
-    pixmap: &mut Pixmap,
     items: &[Json],
     frame: f64,
     transform: Transform,
     opacity: f32,
     depth: usize,
     budget: &mut usize,
-) {
+    fills: &mut Vec<LottieFill>,
+) -> Vec<ShapePath> {
     if depth >= 24 {
-        return;
+        return Vec::new();
     }
-    let mut paths = Vec::new();
+    let mut paths: Vec<ShapePath> = Vec::new();
     for item in items.iter().filter(|item| item["hd"] != true) {
         let Some(left) = budget.checked_sub(1) else {
             break;
@@ -347,14 +365,15 @@ fn lottie_shapes(
                     } else {
                         path.push_rect(rect);
                     }
-                    paths.extend(path.finish());
+                    paths.extend(path.finish().and_then(|shape| shape.transform(transform)));
                 }
             }
             Some("fl") => {
                 let Some(rgb) = lottie_value(&item["c"], frame) else {
                     continue;
                 };
-                let Some(left) = budget.checked_sub(paths.len()) else {
+                let segments = paths.iter().map(|path| path.verbs().len()).sum();
+                let Some(left) = budget.checked_sub(segments) else {
                     break;
                 };
                 *budget = left;
@@ -369,8 +388,12 @@ fn lottie_shapes(
                 } else {
                     FillRule::Winding
                 };
+                let mut combined = PathBuilder::new();
                 for path in &paths {
-                    pixmap.fill_path(path, &paint, rule, transform, None);
+                    combined.push_path(path);
+                }
+                if let Some(path) = combined.finish() {
+                    fills.push(LottieFill { path, paint, rule });
                 }
             }
             Some("sh") => {
@@ -401,7 +424,11 @@ fn lottie_shapes(
                     if path.closed {
                         builder.close();
                     }
-                    paths.extend(builder.finish());
+                    paths.extend(
+                        builder
+                            .finish()
+                            .and_then(|shape| shape.transform(transform)),
+                    );
                 }
             }
             Some("gr") => {
@@ -412,20 +439,21 @@ fn lottie_shapes(
                         .map_or((Transform::identity(), 1.0), |child| {
                             lottie_pose(child, frame)
                         });
-                    lottie_shapes(
-                        pixmap,
+                    paths.extend(lottie_shapes(
                         children,
                         frame,
                         pose.post_concat(transform),
                         opacity * alpha,
                         depth + 1,
                         budget,
-                    );
+                        fills,
+                    ));
                 }
             }
             _ => {}
         }
     }
+    paths
 }
 
 fn sketch(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {
@@ -433,14 +461,17 @@ fn sketch(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {
     let mut preview = metadata_only("No saved Sketch preview is embedded");
     preview.property("Pages", archive.pages.len().to_string());
     preview.property("Sketch format version", archive.version.to_string());
-    if let Some(image) = zip_preview(
+    match zip_preview(
         bytes,
         &["previews/preview.png", "preview.png", "thumbnail.png"],
-    )? {
-        preview.image = embedded(&image, limits);
-        if preview.image.is_ok() {
+        limits,
+    ) {
+        Ok(image) => {
+            preview.image = Ok(image);
             preview.properties.retain(|(key, _)| *key != "Preview");
         }
+        Err(ThumbError::Unsupported) => {}
+        Err(error) => preview.image = Err(error),
     }
     Ok(preview)
 }
@@ -536,9 +567,14 @@ fn xcf(bytes: &[u8], edge: u32, cancel: &Cancel) -> Result<StillPreview, ThumbEr
             }
         };
         let mask = if layer.apply_mask && layer.has_mask() {
-            xcf.layer_mask(index, &mut budget, &keep_going)
-                .map_err(failed)?
-                .map(|(_, pixels)| pixels)
+            match xcf.layer_mask(index, &mut budget, &keep_going) {
+                Ok(mask) => mask.map(|(_, pixels)| pixels),
+                Err(_) if !keep_going() => return Err(ThumbError::Cancelled),
+                Err(error) => {
+                    preview.property("Preview detail", error.to_string());
+                    break;
+                }
+            }
         } else {
             None
         };

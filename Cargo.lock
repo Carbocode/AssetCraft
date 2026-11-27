@@ -296,6 +296,7 @@ name = "assetcraft"
 version = "0.2.0"
 dependencies = [
  "basisu",
+ "cap-primitives",
  "chrono",
  "craft",
  "eframe",

@@ -189,7 +189,7 @@ fn svg(bytes: &[u8], edge: u32, cancel: &Cancel) -> Result<StillPreview, ThumbEr
         embedded_raster_pixels: 8_000_000,
         ..Default::default()
     };
-    let source = tree::text(bytes, &limits).map_err(failed)?;
+    let source = craft::svg::svgz::text(bytes, limits.bytes).map_err(failed)?;
     let checked = tree::preflight(&source, &limits).map_err(failed)?;
     let images = tree::ValidatedImageResolver::new(limits);
     let fonts = SYSTEM_FONTS.get_or_init(|| {
@@ -269,28 +269,71 @@ fn pdf(bytes: Vec<u8>, edge: u32, cancel: &Cancel) -> Result<StillPreview, Thumb
             max_coverage: Some(32 << 20),
             ..Default::default()
         };
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let flag = Arc::new(AtomicBool::new(cancel.is_cancelled()));
         let settings = InterpreterSettings {
             preview: true,
+            cancelled: Some(Arc::clone(&flag)),
             ..Default::default()
         };
-        preview.image = raster::render(page, &raster::RenderCache::new(), &settings, &options)
-            .map_err(failed)
-            .and_then(|rendered| {
-                if rendered.diagnostics.content_truncated
-                    || rendered.diagnostics.image_decode_failed
-                {
-                    preview.property("Preview", "Some PDF content was omitted");
+        let rendered = std::thread::scope(|scope| {
+            // Craft's queue exposes a cancellation query, while the PDF rasterizer reads an atomic flag.
+            let (finished, monitor) = mpsc::channel::<()>();
+            scope.spawn(move || {
+                while !cancel.is_cancelled() {
+                    match monitor.recv_timeout(std::time::Duration::from_millis(10)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => return,
+                    }
                 }
-                straight_rgba(rendered.width, rendered.height, rendered.bytes().to_vec())
+                flag.store(true, Ordering::Relaxed);
             });
+            let result = raster::render(page, &raster::RenderCache::new(), &settings, &options);
+            drop(finished);
+            result
+        });
+        if cancel.is_cancelled() {
+            return Err(ThumbError::Cancelled);
+        }
+        preview.image = rendered.map_err(failed).and_then(|rendered| {
+            if rendered.diagnostics.content_truncated || rendered.diagnostics.image_decode_failed {
+                preview.property("Preview", "Some PDF content was omitted");
+            }
+            straight_rgba(rendered.width, rendered.height, rendered.bytes().to_vec())
+        });
     }
     Ok(preview)
+}
+
+fn epsi_over_limit(postscript: &[u8], limits: Limits) -> bool {
+    postscript
+        .split(|&byte| matches!(byte, b'\n' | b'\r'))
+        .find_map(|line| line.strip_prefix(b"%%BeginPreview:"))
+        .and_then(|line| {
+            let mut numbers = line
+                .split(u8::is_ascii_whitespace)
+                .filter(|word| !word.is_empty())
+                .map(|word| std::str::from_utf8(word).ok()?.parse::<u32>().ok());
+            Some((numbers.next()??, numbers.next()??))
+        })
+        .is_some_and(|(width, height)| {
+            width > limits.max_width
+                || height > limits.max_height
+                || u64::from(width) * u64::from(height) > limits.max_pixels
+        })
 }
 
 fn eps(bytes: &[u8], limits: Limits) -> Result<StillPreview, ThumbError> {
     let sections = craft::eps::sections(bytes).map_err(failed)?;
     let image = if let Some(tiff) = sections.tiff {
         embedded(tiff, limits)
+    } else if epsi_over_limit(sections.postscript, limits) {
+        Err(failed(
+            "Embedded EPS bitmap exceeds the preview pixel limit",
+        ))
     } else if let Some(bitmap) = craft::eps::epsi(sections.postscript) {
         Image::from_u8(
             bitmap.width,
@@ -494,8 +537,22 @@ fn psd(bytes: Vec<u8>, limits: Limits, edge: u32) -> Result<StillPreview, ThumbE
             * u64::from(document.header.depth.div_ceil(8))
             <= limits.max_alloc
     {
-        let preview = document.composite_rgba8().map_err(failed)?;
-        rgba(preview.width, preview.height, preview.data)
+        if document.header.depth == 32 {
+            let rgba_bytes = u64::from(width) * u64::from(height) * 4;
+            let budget = limits.max_alloc.saturating_sub(rgba_bytes);
+            let preview = document.composite_f32_within(budget).map_err(failed)?;
+            let data = preview
+                .data
+                .into_iter()
+                .flat_map(|pixel| {
+                    pixel.map(|sample| (sample.clamp(0.0, 1.0) * 255.0).round() as u8)
+                })
+                .collect();
+            rgba(preview.width, preview.height, data)
+        } else {
+            let preview = document.composite_rgba8().map_err(failed)?;
+            rgba(preview.width, preview.height, preview.data)
+        }
     } else {
         Err(failed("The merged PSD image exceeds the preview limit"))
     };
@@ -506,11 +563,17 @@ fn psd(bytes: Vec<u8>, limits: Limits, edge: u32) -> Result<StillPreview, ThumbE
 
 fn saved_image(format: Format, bytes: &[u8], limits: Limits) -> Result<Image, ThumbError> {
     let data = match format {
-        Format::Ora => zip_preview(bytes, &["mergedimage.png", "Thumbnails/thumbnail.png"])?,
-        Format::Kra => zip_preview(bytes, &["mergedimage.png", "preview.png"])?,
+        Format::Ora => {
+            return zip_preview(
+                bytes,
+                &["mergedimage.png", "Thumbnails/thumbnail.png"],
+                limits,
+            );
+        }
+        Format::Kra => return zip_preview(bytes, &["mergedimage.png", "preview.png"], limits),
         Format::Pcraft => {
             use craft::pcraft_format::{COMPOSITE, FULL_COMPOSITE, THUMB};
-            zip_preview(bytes, &[COMPOSITE, FULL_COMPOSITE, THUMB])?
+            return zip_preview(bytes, &[COMPOSITE, FULL_COMPOSITE, THUMB], limits);
         }
         Format::DesignCraft => craft::designcraft_format::read_preview(Cursor::new(bytes)),
         Format::VectorCraft => vectorcraft(bytes)?,
@@ -519,7 +582,11 @@ fn saved_image(format: Format, bytes: &[u8], limits: Limits) -> Result<Image, Th
     embedded(&data.ok_or(ThumbError::Unsupported)?, limits)
 }
 
-pub(crate) fn zip_preview(bytes: &[u8], names: &[&str]) -> Result<Option<Vec<u8>>, ThumbError> {
+pub(crate) fn zip_preview(
+    bytes: &[u8],
+    names: &[&str],
+    limits: Limits,
+) -> Result<Image, ThumbError> {
     let mut archive = craft::zip::Archive::open(
         bytes,
         craft::zip::Limits {
@@ -531,12 +598,18 @@ pub(crate) fn zip_preview(bytes: &[u8], names: &[&str]) -> Result<Option<Vec<u8>
     if archive.has_duplicate_names() {
         return Err(failed("The document contains duplicate ZIP entries"));
     }
+    let mut last_error = ThumbError::Unsupported;
     for name in names {
-        if let Some(data) = archive.read(name, PREVIEW_BYTES as u64).map_err(failed)? {
-            return Ok(Some(data));
+        match archive.read(name, PREVIEW_BYTES as u64).map_err(failed) {
+            Ok(Some(data)) => match embedded(&data, limits) {
+                Ok(image) => return Ok(image),
+                Err(error) => last_error = error,
+            },
+            Ok(None) => {}
+            Err(error) => last_error = error,
         }
     }
-    Ok(None)
+    Err(last_error)
 }
 
 fn vectorcraft(bytes: &[u8]) -> Result<Option<Vec<u8>>, ThumbError> {
