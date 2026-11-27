@@ -2,9 +2,10 @@
 use std::{collections::VecDeque, path::Path, sync::Arc};
 
 use super::{
-    ByteSource, Cancel, CodecId, CodecParams, File, Format, Image, MAX_SAMPLE_BYTES,
-    ReadSeekSource, Source, ThumbError, TrackDecoder, VideoFrame, avi, failed, isobmff, matroska,
-    mpegts, mxf, open_movie, playback_decoder, playback_packet_safe, poster, supported,
+    AUDIO_FALLBACK_MAX_BYTES, ByteSource, Cancel, CodecId, CodecParams, File, Format, Image,
+    MAX_SAMPLE_BYTES, ReadSeekSource, Source, ThumbError, TrackDecoder, VideoFrame, avi, failed,
+    isobmff, matroska, mpegts, mxf, open_movie, playback_decoder, playback_packet_safe, poster,
+    supported,
 };
 use assetcraft::local_file;
 
@@ -160,7 +161,7 @@ impl Video {
         let duration = duration
             .unwrap_or(sample_end.max(last.saturating_add(DEFAULT_FRAME_NS)))
             .max(last.saturating_add(1));
-        let audio_offset = container.audio_offset();
+        let audio_offset = container.audio_offset(src.len());
         let params = container.params(track, samples[sorted_keys[0].1].entry);
         let large = params.width.unwrap_or(0).max(params.height.unwrap_or(0)) > STILL_EDGE;
         Ok(Self {
@@ -328,7 +329,7 @@ impl Container {
         }
     }
 
-    fn audio_offset(&self) -> Option<i64> {
+    fn audio_offset(&self, bytes: u64) -> Option<i64> {
         let (codec, offset) = match self {
             Self::Mp4(file) => {
                 let track = &file.tracks[file.track_of_kind(isobmff::TrackKind::Audio)?];
@@ -343,8 +344,11 @@ impl Container {
                     });
                 (track.codec_params().codec, ticks_ns(offset, file.timescale))
             }
-            Self::Mkv(file) => {
+            Self::Mkv(file) if bytes <= AUDIO_FALLBACK_MAX_BYTES => {
                 let track = &file.tracks[file.track_of_kind(matroska::TrackKind::Audio)?];
+                if !track.frames_readable() {
+                    return None;
+                }
                 (track.codec_params().codec, 0)
             }
             _ => return None,

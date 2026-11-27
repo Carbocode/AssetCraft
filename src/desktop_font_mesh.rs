@@ -38,6 +38,7 @@ impl Edge {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum GlyphError {
     Unavailable,
     Budget,
@@ -88,7 +89,7 @@ pub(super) fn glyph(
         .flat_map(|contour| segments(contour))
         .filter_map(|(a, b)| Edge::new(a, b))
         .collect();
-    let mut mesh = fill(&edges);
+    let mut mesh = fill(&edges)?;
     if !mesh.is_empty() {
         for contour in &contours {
             feather_contour(&mut mesh, contour, &edges, feather);
@@ -157,7 +158,7 @@ fn feather_contour(mesh: &mut Mesh, contour: &[Point], edges: &[Edge], width: f6
 
 /// Fill the flattened contours according to their nonzero winding. Each span is a
 /// trapezoid between two edges, with bands split where contour edges meet or cross.
-fn fill(edges: &[Edge]) -> Mesh {
+fn fill(edges: &[Edge]) -> Result<Mesh, GlyphError> {
     let mut cuts: Vec<_> = edges
         .iter()
         .flat_map(|edge| [edge.start.y, edge.end.y])
@@ -175,7 +176,7 @@ fn fill(edges: &[Edge]) -> Mesh {
                 cuts.push(top + (bottom - top) * from / (from - to));
             }
             if cuts.len() > 4096 {
-                return Mesh::default();
+                return Err(GlyphError::Budget);
             }
         }
     }
@@ -218,10 +219,10 @@ fn fill(edges: &[Edge]) -> Mesh {
             }
         }
         if mesh.vertices.len() > 24_000 {
-            return Mesh::default();
+            return Err(GlyphError::Budget);
         }
     }
-    mesh
+    Ok(mesh)
 }
 
 #[cfg(test)]
@@ -240,7 +241,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let mesh = fill(&edges);
+        let mesh = fill(&edges).unwrap();
         let area = mesh
             .indices
             .as_chunks::<3>()
@@ -265,6 +266,18 @@ mod tests {
         assert!(mesh.vertices.iter().any(|vertex| {
             vertex.color == Color32::TRANSPARENT && vertex.pos == egui::pos2(4.0, 4.0)
         }));
+    }
+
+    #[test]
+    fn crossings_that_exceed_the_cut_budget_report_omission() {
+        let edges: Vec<_> = (0..100)
+            .filter_map(|i| {
+                let x = f64::from(i);
+                Edge::new((x, 0.0).into(), ((99.0 - x).powi(2), 1.0).into())
+            })
+            .collect();
+        assert!(matches!(fill(&edges), Err(GlyphError::Budget)));
+        assert!(fill(&[]).unwrap().is_empty());
     }
 
     fn outer_points(points: [(f64, f64); 4]) -> [Point; 4] {

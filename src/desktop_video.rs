@@ -18,6 +18,8 @@ use crate::desktop_documents::StillPreview;
 
 const HEADER_BUDGET: u64 = 24 << 20;
 const READ_BUDGET: usize = 64 << 20;
+// The fallback audio decoder can buffer the entire source.
+pub(super) const AUDIO_FALLBACK_MAX_BYTES: u64 = 128 << 20;
 const MAX_SAMPLE_BYTES: u64 = 16 << 20;
 const MAX_PIXELS: u64 = 12_000_000;
 const MAX_EDGE: u32 = 4096;

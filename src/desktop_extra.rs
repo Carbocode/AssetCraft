@@ -330,6 +330,11 @@ fn lottie_pose(pose: &Json, frame: f64) -> (Transform, f32) {
     )
 }
 
+struct LottiePath {
+    shape: ShapePath,
+    opacity: f32,
+}
+
 struct LottieFill {
     path: ShapePath,
     paint: Paint<'static>,
@@ -344,11 +349,16 @@ fn lottie_shapes(
     depth: usize,
     budget: &mut usize,
     fills: &mut Vec<LottieFill>,
-) -> Vec<ShapePath> {
-    if depth >= 24 {
+) -> Vec<LottiePath> {
+    if depth >= 24 || opacity <= 0.0 {
         return Vec::new();
     }
-    let mut paths: Vec<ShapePath> = Vec::new();
+    let mut paths: Vec<LottiePath> = Vec::new();
+    let transformed = |shape: ShapePath| {
+        shape
+            .transform(transform)
+            .map(|shape| LottiePath { shape, opacity })
+    };
     for item in items.iter().filter(|item| item["hd"] != true) {
         let Some(left) = budget.checked_sub(1) else {
             break;
@@ -365,14 +375,14 @@ fn lottie_shapes(
                     } else {
                         path.push_rect(rect);
                     }
-                    paths.extend(path.finish().and_then(|shape| shape.transform(transform)));
+                    paths.extend(path.finish().and_then(transformed));
                 }
             }
             Some("fl") => {
                 let Some(rgb) = lottie_value(&item["c"], frame) else {
                     continue;
                 };
-                let segments = paths.iter().map(|path| path.verbs().len()).sum();
+                let segments = paths.iter().map(|path| path.shape.verbs().len()).sum();
                 let Some(left) = budget.checked_sub(segments) else {
                     break;
                 };
@@ -381,19 +391,26 @@ fn lottie_shapes(
                     (rgb[i].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8
                 });
                 let alpha = lottie_scalar(&item["o"], frame, 100.0).clamp(0.0, 100.0) / 100.0;
-                let mut paint = Paint::default();
-                paint.set_color_rgba8(r, g, b, (alpha * opacity * 255.0).round() as u8);
                 let rule = if item["r"] == 2 {
                     FillRule::EvenOdd
                 } else {
                     FillRule::Winding
                 };
-                let mut combined = PathBuilder::new();
-                for path in &paths {
-                    combined.push_path(path);
-                }
-                if let Some(path) = combined.finish() {
-                    fills.push(LottieFill { path, paint, rule });
+                for run in paths.chunk_by(|a, b| a.opacity == b.opacity) {
+                    let mut combined = PathBuilder::new();
+                    for path in run {
+                        combined.push_path(&path.shape);
+                    }
+                    if let Some(path) = combined.finish() {
+                        let mut paint = Paint::default();
+                        paint.set_color_rgba8(
+                            r,
+                            g,
+                            b,
+                            (alpha * run[0].opacity * 255.0).round() as u8,
+                        );
+                        fills.push(LottieFill { path, paint, rule });
+                    }
                 }
             }
             Some("sh") => {
@@ -424,11 +441,7 @@ fn lottie_shapes(
                     if path.closed {
                         builder.close();
                     }
-                    paths.extend(
-                        builder
-                            .finish()
-                            .and_then(|shape| shape.transform(transform)),
-                    );
+                    paths.extend(builder.finish().and_then(transformed));
                 }
             }
             Some("gr") => {

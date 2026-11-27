@@ -376,7 +376,7 @@ impl AudioReader {
         if matches!(format, Format::Mp4 | Format::Mov) {
             return Ok(Self::Movie(Box::new(MovieAudio::open(file, cancel)?)));
         }
-        if metadata.len() > 128 << 20 {
+        if metadata.len() > crate::desktop_video::AUDIO_FALLBACK_MAX_BYTES {
             if format != Format::Wav {
                 // Some Craft fallback decoders read the entire file.
                 return Err(String::from("Audio preview exceeds the file size limit"));

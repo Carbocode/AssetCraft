@@ -313,11 +313,9 @@ fn epsi_over_limit(postscript: &[u8], limits: Limits) -> bool {
         .split(|&byte| matches!(byte, b'\n' | b'\r'))
         .find_map(|line| line.strip_prefix(b"%%BeginPreview:"))
         .and_then(|line| {
-            let mut numbers = line
-                .split(u8::is_ascii_whitespace)
-                .filter(|word| !word.is_empty())
-                .map(|word| std::str::from_utf8(word).ok()?.parse::<u32>().ok());
-            Some((numbers.next()??, numbers.next()??))
+            let text = String::from_utf8_lossy(line);
+            let mut numbers = text.split_whitespace().map(str::parse::<u32>);
+            Some((numbers.next()?.ok()?, numbers.next()?.ok()?))
         })
         .is_some_and(|(width, height)| {
             width > limits.max_width

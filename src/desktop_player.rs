@@ -291,7 +291,7 @@ impl Player {
             let duration = clip.duration;
             let marks = Arc::clone(&clip.marks);
             let was_playing = self.transport.playing();
-            let wrapped = real && self.transport.advance(ui, duration);
+            let wrapped = real && self.transport.advance_at_frames(ui, duration, &marks);
             if wrapped {
                 self.seek = true;
                 self.stop_decode();

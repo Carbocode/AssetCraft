@@ -1784,6 +1784,62 @@ fn lottie_poster_renders_vector_shapes_on_the_animation_canvas() {
 
 #[cfg(feature = "desktop")]
 #[test]
+fn lottie_parent_fill_preserves_child_group_opacity() {
+    use craft::host::queue::Cancel;
+    use craft::image_codecs::Limits;
+
+    let bytes = br#"{
+        "v":"5.7.4","w":80,"h":40,"fr":30,"ip":0,"op":60,
+        "layers":[{"ty":4,"ip":0,"op":60,"shapes":[
+            {"ty":"rc","p":{"k":[10,20]},"s":{"k":[8,8]}},
+            {"ty":"gr","it":[
+                {"ty":"rc","p":{"k":[30,20]},"s":{"k":[8,8]}},
+                {"ty":"tr","o":{"k":0}}
+            ]},
+            {"ty":"gr","it":[
+                {"ty":"rc","p":{"k":[50,20]},"s":{"k":[8,8]}},
+                {"ty":"tr","o":{"k":50}}
+            ]},
+            {"ty":"fl","c":{"k":[0,1,0,1]}}
+        ]}]
+    }"#;
+    let preview =
+        desktop_extra::render(Format::Lottie, bytes, Limits::default(), 80, &Cancel::new());
+    let pixels = preview.image.unwrap().to_rgba8();
+    assert_eq!(pixels[(20 * 80 + 10) * 4 + 3], 255);
+    assert_eq!(pixels[(20 * 80 + 30) * 4 + 3], 0);
+    assert_eq!(pixels[(20 * 80 + 50) * 4 + 3], 128);
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn epsi_unicode_whitespace_obeys_the_pixel_limit() {
+    use craft::host::queue::Cancel;
+    use craft::image_codecs::Limits;
+
+    let bytes = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 8 2\n%%BeginPreview: 8\u{a0}2 1 2\n% ff\n% 00\n%%EndPreview\n%%EOF";
+    let decode = |max_pixels| {
+        desktop_documents::render(
+            Format::Eps,
+            bytes.as_bytes().to_vec(),
+            Limits {
+                max_pixels,
+                ..Limits::default()
+            },
+            64,
+            &Cancel::new(),
+        )
+        .image
+    };
+    assert!(matches!(
+        decode(15),
+        Err(craft::browse::thumbs::ThumbError::Failed(message)) if message.contains("pixel limit")
+    ));
+    assert_eq!(decode(16).unwrap().dimensions(), (8, 2));
+}
+
+#[cfg(feature = "desktop")]
+#[test]
 fn eps_preview_reads_image_magick_rgb_without_interpreting_postscript() {
     use craft::host::queue::Cancel;
     use craft::image_codecs::Limits;
